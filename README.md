@@ -135,6 +135,21 @@ npm start
 
 页面上：跳过行以紫色「已跳过」徽标与置灰底色展示，重算时段与实际/预计时间列显示「—」，实际开始列附跳过原因标签；舞监可点「跳过原因」回看详情；版本列表新增「已跳过」计数；执行账号的现场页对跳过项只读且无登记按钮。
 
+#### 排期开始时刻来源解释（本轮新增）
+
+现场发现提示项顺延时，舞监与执行岗位可对**当前执行版或任一历史版本**中的一条**未开始项**查看其**排期开始时刻如何形成**。入口为现场联排表与版本回看表中未开始项「重算开始」格内的**「排期来源」**按钮（弹窗内可「刷新解释」）。解释内容：
+
+- **以该项原计划开始为基线**，明确给出最终排期开始时刻；当开始仍等于原计划时直接结论**「无需顺延」**（含无前置与前置结束均不晚于原计划两种情况）；
+- 顺延时列出**所有达到最终最大约束时刻的直接前置**——`开始 = max(原计划开始, 各未跳过前置重算结束)`，同一最大时刻由多条路径并列决定时**全部展示，不任意只取一条**；
+- 沿其中**尚未开始的前置逐层向上追溯**，链上每个节点都标明其结束时刻采用：
+  - **实际完成**（已完成项，最终现场事实）；
+  - **预计结束**（已登记预计结束的未开始/已开始项，结束时间由预计结束直接决定）；
+  - **按时长推算**（未登记结束时间：重算开始 + 该项时长；其开始若也被推后则继续向上追溯）；
+- 其他未跳过前置列入「不决定最终时刻」并注明原因（结束不晚于原计划 / 早于最终约束时刻）；**已跳过前置不构成约束**，单列说明「后继重算忽略该项」；
+- 解释由与现场重算**完全相同的 `computeLive` 计算与同一版本数据**即时生成，因此**与同一版本的现场重算结果一致**；岗位登记、舞监更正或跳过之后，点「刷新解释」（或重新打开）即可看到**新解释**；
+- **历史版本按归档状态只读回看**（弹窗标注「历史版本·只读」）；整个查询为只读 GET，**不改动任何登记与已发布计划**；
+- 目标**已开始 / 已完成 / 已跳过**时返回明确结论（说明为何不存在顺延来源）；**提示项不存在、版本不存在**返回 404；未登录返回 401。
+
 ### 执行岗位
 
 - 「现场联排」页只能看到当前执行版本，本岗位的行高亮并出现操作按钮：
@@ -217,6 +232,7 @@ SESSION_SECRET=your-long-random-secret
 | GET | `/api/live/skips/preview` | 舞监 | **依赖链跳过影响预览**（仅当前执行版）：根项及沿前置可达的全部后继、各项行版本、阻断项与已跳过原因 |
 | POST | `/api/live/skips` | 舞监 | **确认跳过整条依赖链**（非空原因 + 预览所见行版本；事务内核验，阻断/版本变化整体拒绝；首跳清除预计结束并留痕，已跳过项不重复留痕） |
 | GET | `/api/versions` `/api/versions/:id` | 已登录 | 版本列表（含 `skipCount`）与历史回看（每行含更正历史 `corrections` 与跳过留痕 `skip`） |
+| GET | `/api/versions/:id/explain?cueRef=` | 已登录 | **未开始项排期开始时刻来源解释（只读，当前版/历史版同一接口）**：基线原计划开始、全部并列决定性直接前置、逐层来源链（实际完成/预计结束/按时长推算）、非决定性与已跳过前置；目标已开始/完成/跳过时返回 `explainable:false` 结论；版本/提示项不存在 404 |
 
 ## 八、登记交接 API 调用示例
 
@@ -557,3 +573,53 @@ curl -b sound.cookie -s -X POST http://localhost:3000/api/registrations \
 | 预览所见登记行版本变化 | 409 | `VERSION_CONFLICT`（`items` 逐项列出当前版本） |
 | 执行账号登记跳过项 / 舞监更正跳过项 | 409 | `CUE_SKIPPED` |
 
+## 十一、排期开始时刻来源解释 API 调用示例
+
+舞监与执行岗位均可用（只读 GET）；当前执行版与历史归档版使用同一接口，仅路径版本号不同。
+
+```bash
+curl -c sm.cookie -s -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' -d '{"username":"sm","password":"sm12345"}'
+
+# 解释第 1 版中未开始项 L3（cueRef=6）的排期开始时刻
+curl -b sm.cookie -s "http://localhost:3000/api/versions/1/explain?cueRef=6"
+```
+
+响应示例（依赖 `S1 → L2 → L3`：L1 已于 19:08 实际完成，S1 已开始并预计 19:15 结束，L2 未开始、按 8 分钟时长推算）：
+
+```json
+{
+  "versionId": 1, "versionNo": 1, "isLatest": true,
+  "target": { "cueRef": 6, "code": "L3", "title": "落幕收光", "position": "灯光",
+              "status": "PENDING", "plannedStartText": "19:20", "schedStartText": "19:23", "schedEndText": "19:27" },
+  "plannedStartText": "19:20", "schedStartText": "19:23",
+  "delayed": true, "explainable": true, "needsDelay": true,
+  "summary": "排期开始由原计划开始 19:20 顺延至 19:23，由 1 条直接前置约束决定。",
+  "ruleText": "重算规则：开始 = max(原计划开始，各未跳过前置的重算结束)；已跳过前置不构成约束。",
+  "decisiveCount": 1,
+  "decisiveTrees": [
+    { "cueRef": 4, "code": "L2", "status": "PENDING", "schedStartText": "19:15", "schedEndText": "19:23",
+      "endSource": "duration", "endSourceLabel": "按时长推算",
+      "endBasisText": "未登记结束时间，按重算开始 19:15 + 时长推算至 19:23",
+      "upstream": [
+        { "cueRef": 2, "code": "S1", "status": "RUNNING", "schedStartText": "19:08", "schedEndText": "19:15",
+          "endSource": "estimate", "endSourceLabel": "预计结束",
+          "endBasisText": "结束取登记的预计结束 19:15",
+          "leaf": true, "leafReason": "已实际开始，结束由实际开始与时长/预计结束确定，为现场事实来源",
+          "upstream": [] }
+      ] }
+  ],
+  "otherPreds": [],
+  "skippedPreds": []
+}
+```
+
+要点：
+
+- **多条并列**：若 L2 与 S2 的重算结束同为最终最大时刻（如均为 19:23），`decisiveCount` 为 2，两棵来源树都在 `decisiveTrees` 中返回，不会只取一条；
+- **无需顺延**：开始仍等于原计划时 `needsDelay=false`、`decisiveTrees=[]`，`summary` 明确为「无需顺延」；较弱的前置出现在 `otherPreds` 并注明「结束 xx 不晚于原计划开始，不改变开始时刻」；
+- **已跳过前置**出现在 `skippedPreds`，注明「已跳过前置不构成约束，后继重算忽略该项」；
+- 结束来源标记 `endSource ∈ actual | estimate | duration`（实际完成 / 预计结束 / 按时长推算）；已完成项为事实叶节点，未开始且按时长推算的节点会继续向上追溯，登记了预计结束的未开始项在该节点终止追溯；
+- **目标不可解释**：目标为 `DONE / RUNNING / SKIPPED` 时 HTTP 200 且 `explainable:false`，带 `status` 与明确 `reason`；
+- **错误**：版本不存在 → 404 `VERSION_NOT_FOUND`；提示项不在该版本 → 404 `NOT_FOUND`；`cueRef` 非法 → 400 `BAD_INPUT`；未登录 → 401。
+- 解释内容与 `GET /api/live`、`GET /api/versions/:id` 的现场重算同源同算法；登记 / 更正 / 跳过后重新请求即得新解释；接口只读，不改动登记与已发布计划。

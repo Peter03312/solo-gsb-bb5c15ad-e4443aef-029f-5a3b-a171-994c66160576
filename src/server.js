@@ -758,6 +758,242 @@ app.get('/api/live', requireAuth, (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ---------- 排期开始时刻来源解释（只读，当前执行版与历史版本均可） ----------
+
+// 结束时间依据：实际完成 / 预计结束 / 按时长推算
+const END_SOURCE_META = {
+  actual: { label: '实际完成', basis: (s, e) => `结束取实际完成 ${e}` },
+  estimate: { label: '预计结束', basis: (s, e) => `结束取登记的预计结束 ${e}` },
+  duration: { label: '按时长推算', basis: (s, e) => `未登记结束时间，按重算开始 ${s} + 时长推算至 ${e}` },
+};
+
+function endSourceOf(c) {
+  if (c.status === 'DONE') return 'actual';
+  if (c.estimatedEnd !== null) return 'estimate';
+  return 'duration';
+}
+
+function cueBrief(c) {
+  return {
+    cueRef: c.id,
+    code: c.code,
+    title: c.title,
+    position: c.position,
+    status: c.status,
+    plannedStartText: minToTime(c.plannedStart),
+    plannedEndText: minToTime(c.plannedStart + c.duration),
+    schedStartText: minToTime(c.schedStart),
+    schedEndText: minToTime(c.schedEnd),
+    actualStartText: minToTime(c.actualStart),
+    actualEndText: minToTime(c.actualEnd),
+    estimatedEndText: minToTime(c.estimatedEnd),
+    duration: c.duration,
+    delayed: c.delayed === true,
+  };
+}
+
+/**
+ * 未开始项排期开始时刻的来源解释。
+ * 以 computeLive 的同一重算结果为唯一数据来源（保证与现场重算一致）：
+ *  - 基线为该项原计划开始；重算开始 = max(原计划开始, 各未跳过前置的重算结束)
+ *  - 达到最终最大时刻的直接前置全部列出（并列不丢弃）；
+ *  - 沿其中尚未开始（PENDING）的前置逐层向上追溯，每个节点标明结束时间来自
+ *    实际完成 / 预计结束 / 按时长推算；
+ *  - 已跳过前置不构成约束，单列说明；原计划本身决定开始时明确返回「无需顺延」。
+ */
+function buildScheduleExplain(versionRow, cueRef) {
+  const cues = db.prepare(
+    `SELECT cue_ref, code, title, position, planned_start, duration
+     FROM published_cues WHERE version_id = ? ORDER BY id`
+  ).all(versionRow.id).map((c) => ({
+    id: c.cue_ref, code: c.code, title: c.title, position: c.position,
+    plannedStart: c.planned_start, duration: c.duration,
+  }));
+  const deps = db.prepare(
+    'SELECT from_ref, to_ref FROM published_deps WHERE version_id = ? ORDER BY id'
+  ).all(versionRow.id).map((d) => ({ from: d.from_ref, to: d.to_ref }));
+
+  const regRows = db.prepare('SELECT * FROM registrations WHERE version_id = ?').all(versionRow.id);
+  const regMap = new Map();
+  for (const r of regRows) {
+    regMap.set(r.cue_ref, {
+      actualStart: r.actual_start, actualEnd: r.actual_end,
+      estimatedEnd: r.estimated_end, skipped: r.skipped === 1,
+      rowVer: r.row_ver, updatedBy: r.updated_by, updatedAt: r.updated_at,
+    });
+  }
+
+  // 与现场重算同一函数、同一输入；解释中的重算开始即现场页所见值
+  const live = computeLive(cues, deps, regMap);
+  if (live.orderProblem) {
+    return { orderProblem: live.orderProblem };
+  }
+  const calc = new Map(live.cues.map((c) => [c.id, c]));
+  const preds = new Map(cues.map((c) => [c.id, []]));
+  for (const d of deps) {
+    if (preds.has(d.to) && calc.has(d.from)) preds.get(d.to).push(d.from);
+  }
+  const orderKey = (id) => {
+    const c = calc.get(id);
+    return [c ? c.plannedStart : 0, id];
+  };
+
+  const target = calc.get(cueRef);
+  if (!target) {
+    return { notFound: true };
+  }
+
+  const latestNo = db.prepare('SELECT MAX(version_no) AS m FROM rehearsal_versions').get().m;
+  const isLatest = versionRow.version_no === latestNo;
+  const base = {
+    versionId: versionRow.id,
+    versionNo: versionRow.version_no,
+    versionNote: versionRow.note,
+    isLatest,
+    target: cueBrief(target),
+    plannedStartText: minToTime(target.plannedStart),
+    schedStartText: minToTime(target.schedStart),
+    delayed: target.delayed === true,
+  };
+  if (!isLatest) Object.assign(base, { archived: true, readOnly: true });
+
+  if (target.status !== 'PENDING') {
+    return {
+      ...base,
+      explainable: false,
+      status: target.status,
+      reason: target.status === 'DONE'
+        ? '该项已实际完成，开始时间为实际开始，不存在顺延来源'
+        : target.status === 'RUNNING'
+          ? '该项已实际开始，重算开始取实际开始，不存在未开始项的顺延来源'
+          : '该项已被舞监标记为跳过（不再执行），不产生待执行排期，无顺延来源',
+    };
+  }
+
+  const activePredIds = [];
+  const skippedPreds = [];
+  for (const pid of preds.get(cueRef)) {
+    const pc = calc.get(pid);
+    if (!pc) continue;
+    if (pc.status === 'SKIPPED') {
+      skippedPreds.push({ ...cueBrief(pc), note: '已跳过前置不构成约束，后继重算忽略该项' });
+    } else {
+      activePredIds.push(pid);
+    }
+  }
+  activePredIds.sort((a, b) => {
+    const ka = orderKey(a), kb = orderKey(b);
+    return ka[0] - kb[0] || ka[1] - kb[1];
+  });
+  skippedPreds.sort((a, b) => a.cueRef - b.cueRef);
+
+  const finalStart = target.schedStart;
+  // 达到最终最大约束时刻的直接前置：重算结束等于最终开始；并列时全部返回
+  const decisive = activePredIds.filter((pid) => calc.get(pid).schedEnd === finalStart && finalStart > target.plannedStart);
+  const others = activePredIds
+    .filter((pid) => !decisive.includes(pid))
+    .map((pid) => {
+      const pc = calc.get(pid);
+      return {
+        ...cueBrief(pc),
+        constrains: pc.schedEnd > target.plannedStart,
+        note: pc.schedEnd <= target.plannedStart
+          ? `结束 ${minToTime(pc.schedEnd)} 不晚于原计划开始，不改变开始时刻`
+          : `结束 ${minToTime(pc.schedEnd)} 早于最终约束时刻 ${minToTime(finalStart)}，非决定性约束`,
+      };
+    });
+
+  // 沿尚未开始的决定性前置逐层追溯（DONE/RUNNING 为来源叶节点；PENDING 且登记预计结束时结束由预计决定）
+  const nodes = new Map();
+  function buildNode(id, depth) {
+    if (nodes.has(id)) return nodes.get(id);
+    const c = calc.get(id);
+    const source = endSourceOf(c);
+    const meta = END_SOURCE_META[source];
+    const node = {
+      ...cueBrief(c),
+      endSource: source,
+      endSourceLabel: meta.label,
+      endBasisText: meta.basis(minToTime(c.schedStart), minToTime(c.schedEnd)),
+      depth,
+      upstream: [],
+      leaf: true,
+      leafReason: '',
+    };
+    nodes.set(id, node);
+    if (c.status === 'PENDING' && c.estimatedEnd === null && depth < 64) {
+      // 自身结束按重算开始 + 时长推算：其开始仍可能被更上游前置推后，继续逐层追溯
+      const ups = preds.get(id)
+        .filter((pid) => {
+          const pc = calc.get(pid);
+          return pc && pc.status !== 'SKIPPED';
+        })
+        .filter((pid) => calc.get(pid).schedEnd === c.schedStart && c.schedStart > c.plannedStart)
+        .sort((a, b) => {
+          const ka = orderKey(a), kb = orderKey(b);
+          return ka[0] - kb[0] || ka[1] - kb[1];
+        });
+      node.upstream = ups.map((pid) => buildNode(pid, depth + 1));
+      node.leaf = node.upstream.length === 0;
+      if (node.leaf) node.leafReason = node.delayed ? '' : '其开始即原计划开始，无更上游约束';
+    } else if (c.status === 'PENDING') {
+      node.leafReason = '已登记预计结束，结束时间由预计结束直接决定，不再向上追溯';
+    } else if (c.status === 'RUNNING') {
+      node.leafReason = '已实际开始，结束由实际开始与时长/预计结束确定，为现场事实来源';
+    } else if (c.status === 'DONE') {
+      node.leafReason = '已实际完成，结束时间为现场登记的实际完成，为最终事实来源';
+    }
+    return node;
+  }
+
+  const decisiveTrees = decisive.map((pid) => buildNode(pid, 0));
+
+  const needsDelay = finalStart > target.plannedStart;
+  const noPreds = activePredIds.length === 0 && skippedPreds.length === 0;
+  let summary;
+  if (!needsDelay) {
+    summary = noPreds
+      ? '该项没有前置，排期开始即原计划开始，无需顺延。'
+      : `排期开始仍为原计划开始 ${minToTime(target.plannedStart)}：未跳过前置的结束均未推后开始时刻，无需顺延。`;
+  } else {
+    summary = `排期开始由原计划开始 ${minToTime(target.plannedStart)} 顺延至 ${minToTime(finalStart)}，`
+      + `由 ${decisive.length} 条直接前置约束决定${decisive.length > 1 ? '（多条并列达到同一最大时刻，已全部列出）' : ''}。`;
+  }
+
+  return {
+    ...base,
+    explainable: true,
+    needsDelay,
+    summary,
+    ruleText: '重算规则：开始 = max(原计划开始，各未跳过前置的重算结束)；已跳过前置不构成约束。',
+    decisiveCount: decisive.length,
+    decisiveTrees,
+    otherPreds: others,
+    skippedPreds,
+    activePredCount: activePredIds.length,
+  };
+}
+
+// 排期来源解释：舞监与执行岗位均可，只读回看；当前执行版与历史归档版使用同一接口
+app.get('/api/versions/:id/explain', requireAuth, (req, res, next) => {
+  try {
+    const versionId = Number(req.params.id);
+    if (!Number.isInteger(versionId)) throw new ApiError(400, 'BAD_INPUT', '版本号无效');
+    const cueRef = Number(req.query.cueRef);
+    if (!Number.isInteger(cueRef)) throw new ApiError(400, 'BAD_INPUT', '缺少有效的提示项引用 cueRef');
+    const row = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(versionId);
+    if (!row) throw new ApiError(404, 'VERSION_NOT_FOUND', '联排版本不存在');
+    const result = buildScheduleExplain(row, cueRef);
+    if (result.orderProblem) {
+      throw new ApiError(409, 'PLAN_ORDER_PROBLEM', result.orderProblem);
+    }
+    if (result.notFound) {
+      throw new ApiError(404, 'NOT_FOUND', '提示项不存在于该版本');
+    }
+    res.json(result);
+  } catch (e) { next(e); }
+});
+
 // ---------- 舞监：岗位代班（仅当前执行版可变更） ----------
 
 // 代班管理视图：当前执行版的代班记录（含已撤销历史）；舞监另返回可选岗位与执行账号

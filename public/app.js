@@ -12,6 +12,7 @@ const state = {
   handoverLoading: false,
   deputies: null,
   skipPreview: null,
+  explainCtx: null,
 };
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -483,6 +484,17 @@ function skipTag(c) {
   return `<div class="skip-tag" title="${tip}">⛔ 跳过${c.skip.rootCode && c.skip.rootCode !== c.code ? `（随 ${esc(c.skip.rootCode)}）` : ''}：${esc(c.skip.reason)}</div>`;
 }
 
+// ---------- 排期开始时刻来源解释 ----------
+
+// 重算开始单元格：未开始项附「排期来源」入口（舞监/执行岗位、当前版/归档回看均可只读查看）
+function schedStartCell(c, delayedHtml, skipped, scope) {
+  if (skipped) return '—';
+  const btn = c.status === 'PENDING'
+    ? `<div><button class="ghost tiny explain-btn" data-act="open-explain" data-scope="${scope}" data-cue="${c.id}">排期来源</button></div>`
+    : '';
+  return `${c.schedStartText}${delayedHtml}${btn}`;
+}
+
 function renderConflicts(conflicts) {
   const box = $('#live-conflicts');
   if (!conflicts?.length) { box.innerHTML = ''; return; }
@@ -548,7 +560,7 @@ function renderLive() {
       <td>${esc(c.title)}</td>
       <td>${esc(c.position)}${deputyPosTag(activeDepByPos.get(c.position))}</td>
       <td class="mono">${c.plannedStartText} - ${minText(c.plannedStart + c.duration)}</td>
-      <td class="mono">${skipped ? '—' : `${c.schedStartText}${delayed}`}</td>
+      <td class="mono">${schedStartCell(c, delayed, skipped, 'live')}</td>
       <td class="mono">${skipped ? '—' : c.schedEndText}</td>
       <td>${statusBadge(c.status)}<div class="muted">v${c.rowVer}</div></td>
       <td class="mono">${skipped ? '—' : (c.actualStartText ?? '—')}${handoverTag(c)}${skipTag(c)}</td>
@@ -779,7 +791,7 @@ function renderHistoryHtml(cue, v) {
 }
 
 $('#live-tbody').addEventListener('click', (ev) => {
-  const corrBtn = ev.target.closest('button[data-act="open-correct"], button[data-act="open-history"], button[data-act="open-skip-preview"], button[data-act="open-skip-view"]');
+  const corrBtn = ev.target.closest('button[data-act="open-correct"], button[data-act="open-history"], button[data-act="open-skip-preview"], button[data-act="open-skip-view"], button[data-act="open-explain"]');
   if (!corrBtn) return;
   const cueId = Number(corrBtn.dataset.cue);
   const { v, cue } = findCueInContext('live', cueId);
@@ -790,6 +802,8 @@ $('#live-tbody').addEventListener('click', (ev) => {
     openSkipPreview(cueId);
   } else if (corrBtn.dataset.act === 'open-skip-view') {
     openSkipView(cue, v);
+  } else if (corrBtn.dataset.act === 'open-explain') {
+    openScheduleExplain('live', cueId);
   } else {
     openCorrectForm(cue, v);
   }
@@ -882,6 +896,162 @@ function openSkipView(cue, v) {
     </div>`);
   $('#skip-view-close').addEventListener('click', closeModal);
 }
+
+// ---------- 排期开始时刻来源解释（只读来源链） ----------
+
+const END_SOURCE_LABEL = {
+  actual: { text: '实际完成', cls: 'src-actual' },
+  estimate: { text: '预计结束', cls: 'src-estimate' },
+  duration: { text: '按时长推算', cls: 'src-duration' },
+};
+
+function explainCueTitle(c) {
+  return `<strong>${esc(c.code)}</strong> ${esc(c.title || '')}（${esc(c.position)}）`;
+}
+
+// 递归渲染一条决定路径上的来源节点
+function explainNodeHtml(node) {
+  const src = END_SOURCE_LABEL[node.endSource] || { text: node.endSourceLabel, cls: '' };
+  const upstream = node.upstream?.length
+    ? `<ul class="explain-tree">${node.upstream.map((u) => `<li>${explainNodeHtml(u)}</li>`).join('')}</ul>`
+    : (node.leafReason ? `<div class="explain-leaf">↳ ${esc(node.leafReason)}</div>` : '');
+  return `<div class="explain-node ${src.cls}">
+    <div class="explain-node-head">
+      ${explainCueTitle(node)}
+      <span class="explain-src-tag">${esc(src.text)}</span>
+      ${node.delayed ? '<span class="explain-delayed-tag">已顺延</span>' : ''}
+    </div>
+    <div class="explain-times">
+      计划 ${esc(node.plannedStartText)}-${esc(node.plannedEndText)}
+      ｜重算开始 <strong>${esc(node.schedStartText)}</strong>｜结束 ${esc(node.schedEndText)}
+    </div>
+    <div class="explain-basis">${esc(node.endBasisText)}</div>
+    ${upstream}
+  </div>`;
+}
+
+function explainPredRowHtml(p, skipped) {
+  const times = skipped
+    ? `计划 ${esc(p.plannedStartText)}-${esc(p.plannedEndText)}`
+    : `计划 ${esc(p.plannedStartText)}-${esc(p.plannedEndText)}｜重算结束 ${esc(p.schedEndText)}`;
+  return `<tr class="${skipped ? 'explain-skip-pred' : ''}">
+    <td><strong>${esc(p.code)}</strong></td>
+    <td>${esc(p.title || '')}</td>
+    <td>${esc(p.position)}</td>
+    <td class="mono">${times}</td>
+    <td>${skipped ? '<span class="badge skipped">已跳过</span>' : statusBadge(p.status)}</td>
+    <td class="muted">${esc(p.note || '')}</td>
+  </tr>`;
+}
+
+function renderScheduleExplain(d) {
+  const t = d.target;
+  const versionTag = d.isLatest
+    ? '<span class="latest-tag">当前执行版本</span>'
+    : '<span class="latest-tag" style="background:#999">历史版本·只读</span>';
+
+  const notExplainableHtml = d.explainable === false
+    ? `<div class="explain-result explain-blocked">
+         <div>${statusBadge(d.status)} ${explainCueTitle(t)}</div>
+         <div class="muted">${esc(d.reason)}</div>
+       </div>`
+    : '';
+
+  const resultBanner = d.explainable === false
+    ? ''
+    : d.needsDelay
+      ? `<div class="explain-result explain-delayed">
+           <strong>📌 ${esc(d.summary)}</strong>
+           <div class="muted">原计划开始 ${esc(d.plannedStartText)} → 排期开始 <strong>${esc(d.schedStartText)}</strong></div>
+         </div>`
+      : `<div class="explain-result explain-ontime">
+           <strong>✅ ${esc(d.summary)}</strong>
+           <div class="muted">原计划开始（基线）${esc(d.plannedStartText)} ＝ 排期开始 ${esc(d.schedStartText)}，明确无需顺延</div>
+         </div>`;
+
+  const treesHtml = d.explainable === false ? '' : `
+    <h4>达到最终最大约束时刻的直接前置（${d.decisiveCount} 条${d.decisiveCount > 1 ? '，多路径并列全部展示' : ''}）</h4>
+    ${d.decisiveTrees.length
+      ? d.decisiveTrees.map((n) => `<ul class="explain-tree explain-root-tree"><li>${explainNodeHtml(n)}</li></ul>`).join('')
+      : '<div class="muted">无决定性直接前置（开始时刻由原计划本身决定）。</div>'}`;
+
+  const othersHtml = d.explainable === false ? '' : (d.otherPreds?.length
+    ? `<h4>其他未跳过前置（不决定最终时刻）</h4>
+       <div class="table-wrap"><table class="explain-table">
+         <thead><tr><th>编号</th><th>说明</th><th>岗位</th><th>时段</th><th>状态</th><th>说明</th></tr></thead>
+         <tbody>${d.otherPreds.map((p) => explainPredRowHtml(p, false)).join('')}</tbody>
+       </table></div>` : '');
+
+  const skippedHtml = d.explainable === false ? '' : (d.skippedPreds?.length
+    ? `<h4>已跳过前置（不构成约束）</h4>
+       <div class="table-wrap"><table class="explain-table">
+         <thead><tr><th>编号</th><th>说明</th><th>岗位</th><th>计划时段</th><th>状态</th><th>说明</th></tr></thead>
+         <tbody>${d.skippedPreds.map((p) => explainPredRowHtml(p, true)).join('')}</tbody>
+       </table></div>` : '');
+
+  return `
+    <div class="explain-view">
+      <div class="muted">
+        第 ${d.versionNo} 版 ${esc(d.versionNote || '')} ${versionTag}<br>
+        目标项：${explainCueTitle(t)}　原计划开始（基线）<strong>${esc(d.plannedStartText)}</strong>，
+        当前排期开始 <strong>${esc(d.schedStartText)}</strong>
+      </div>
+      ${notExplainableHtml}
+      ${resultBanner}
+      <div class="muted explain-rule">${esc(d.ruleText || '')}</div>
+      ${treesHtml}
+      ${othersHtml}
+      ${skippedHtml}
+      <div class="muted">
+        解释与同一版本的现场重算结果实时一致；登记、更正或跳过后点「刷新解释」即可看到新来源链。
+        本操作只读，不改动任何登记与已发布计划。
+      </div>
+      <div class="form-actions">
+        <button type="button" class="primary tiny" id="explain-refresh">刷新解释</button>
+        <button type="button" class="ghost tiny" id="explain-close">关闭</button>
+      </div>
+    </div>`;
+}
+
+async function openScheduleExplain(scope, cueId) {
+  const v = scope === 'live' ? state.live : state.detail;
+  if (!v) return;
+  const cue = v.cues.find((x) => x.id === cueId);
+  if (!cue) return;
+  state.explainCtx = { scope, cueId };
+  openModal(`排期来源：${cue.code}`, '<div class="muted">正在沿前置链追溯排期开始时刻的形成…</div>');
+  await loadScheduleExplain();
+}
+
+async function loadScheduleExplain() {
+  const ctx = state.explainCtx;
+  if (!ctx) return;
+  const v = ctx.scope === 'live' ? state.live : state.detail;
+  try {
+    const d = await api('GET', `/api/versions/${v.id}/explain?cueRef=${ctx.cueId}`);
+    const cue = d.target;
+    openModal(`排期来源：${cue.code}`, renderScheduleExplain(d));
+  } catch (e) {
+    $('#modal-body').innerHTML =
+      `<div class="explain-result explain-blocked"><strong>${esc(e.message)}</strong>
+         <div class="muted">请关闭后刷新页面重试；本操作不会改动任何登记或计划。</div>
+         <div class="form-actions"><button type="button" class="ghost tiny" id="explain-close">关闭</button></div>
+       </div>`;
+  }
+}
+
+$('#modal-overlay').addEventListener('click', (ev) => {
+  if (ev.target.closest('#explain-close')) { closeModal(); state.explainCtx = null; return; }
+  if (ev.target.closest('#explain-refresh')) {
+    // 现场页先重新拉取重算结果，保证解释与页面一致；历史版本为归档只读，直接重取解释
+    const ctx = state.explainCtx;
+    if (ctx && ctx.scope === 'live') {
+      loadLive().then(() => loadScheduleExplain()).catch((e) => alertBar('error', errorToHtml(e)));
+    } else {
+      loadScheduleExplain().catch((e) => alertBar('error', errorToHtml(e)));
+    }
+  }
+});
 
 $('#modal-overlay').addEventListener('submit', async (ev) => {
   const form = ev.target.closest('#skip-form');
@@ -1061,6 +1231,11 @@ $('#versions-tbody').addEventListener('click', async (ev) => {
 
 // 回看页（含归档版本）只展示更正历史与跳过原因，不提供更正/跳过入口
 $('#version-detail').addEventListener('click', (ev) => {
+  const explainBtn = ev.target.closest('button[data-act="open-explain"]');
+  if (explainBtn) {
+    openScheduleExplain('detail', Number(explainBtn.dataset.cue));
+    return;
+  }
   const histBtn = ev.target.closest('button[data-act="open-history"]');
   if (histBtn) {
     const cueId = Number(histBtn.dataset.cue);
@@ -1115,7 +1290,7 @@ function renderDetail() {
         <td>${esc(c.title)}</td>
         <td>${esc(c.position)}</td>
         <td class="mono">${c.plannedStartText} - ${minText(c.plannedStart + c.duration)}</td>
-        <td class="mono">${skipped ? '—' : `${c.schedStartText}${c.delayed ? '<div class="delayed">顺延</div>' : ''}`}</td>
+        <td class="mono">${schedStartCell(c, c.delayed ? '<div class="delayed">顺延</div>' : '', skipped, 'detail')}</td>
         <td class="mono">${skipped ? '—' : c.schedEndText}</td>
         <td>${statusBadge(c.status)}</td>
         <td class="mono">${skipped ? '—' : (c.actualStartText ?? '—')}${handoverTag(c)}${skipTag(c)}</td>
