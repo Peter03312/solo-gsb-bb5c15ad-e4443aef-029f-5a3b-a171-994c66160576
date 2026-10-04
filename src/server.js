@@ -1,0 +1,1382 @@
+'use strict';
+
+process.env.TZ = process.env.TZ || 'Asia/Shanghai';
+
+const path = require('path');
+const express = require('express');
+const session = require('express-session');
+
+const { db, getMeta, setMeta } = require('./db');
+const { verifyPassword } = require('./auth');
+const { init } = require('./initdb');
+const { timeToMin, minToTime, validatePlan, computeLive, topoAnalyze } = require('./scheduling');
+
+init();
+
+const app = express();
+app.use(express.json());
+app.use(
+  session({
+    name: 'cueboard.sid',
+    secret: process.env.SESSION_SECRET || 'cueboard-dev-secret-change-me',
+    resave: false,
+    saveUninitialized: false,
+    cookie: { httpOnly: true, sameSite: 'lax', maxAge: 12 * 60 * 60 * 1000 },
+  })
+);
+
+class ApiError extends Error {
+  constructor(status, code, message, extra = {}) {
+    super(message);
+    this.status = status;
+    this.code = code;
+    this.extra = extra;
+  }
+}
+
+// ---------- 辅助 ----------
+
+function currentMinute() {
+  const d = new Date();
+  return d.getHours() * 60 + d.getMinutes();
+}
+
+function positionsList() {
+  try {
+    return JSON.parse(getMeta('positions', '[]'));
+  } catch {
+    return [];
+  }
+}
+
+function requireAuth(req, res, next) {
+  if (!req.session.user) return next(new ApiError(401, 'UNAUTHORIZED', '尚未登录'));
+  next();
+}
+
+function requireSM(req, res, next) {
+  if (!req.session.user) return next(new ApiError(401, 'UNAUTHORIZED', '尚未登录'));
+  if (req.session.user.role !== 'sm') return next(new ApiError(403, 'FORBIDDEN', '仅舞监可执行该操作'));
+  next();
+}
+
+function checkDraftVersion(bodyVersion) {
+  const current = Number(getMeta('draft_version', '0'));
+  if (bodyVersion === undefined || bodyVersion === null || Number(bodyVersion) !== current) {
+    throw new ApiError(409, 'VERSION_CONFLICT',
+      `草稿已被他人修改：当前版本号为 ${current}，提交基于 ${bodyVersion ?? '空'}，请刷新后重试`,
+      { currentVersion: current, submittedVersion: bodyVersion ?? null });
+  }
+  return current;
+}
+
+function bumpDraftVersion() {
+  const v = Number(getMeta('draft_version', '0')) + 1;
+  setMeta('draft_version', v);
+  return v;
+}
+
+// ---------- 岗位代班（现场临时换人） ----------
+
+function activeDeputyRows(versionId) {
+  return db.prepare('SELECT * FROM position_deputies WHERE version_id = ? AND active = 1').all(versionId);
+}
+
+// 执行账号在某版本上的可登记岗位集合：
+// 原岗位（未被代班顶替时保留）+ 本人作为在任代班的岗位（代班期间获得该岗位登记权，且保留自己原有岗位权限）
+function effectivePositionsFor(user, versionId) {
+  const deps = activeDeputyRows(versionId);
+  const byPos = new Map(deps.map((d) => [d.position, d]));
+  const set = new Set();
+  if (user.position) {
+    const dep = byPos.get(user.position);
+    if (!dep || dep.deputy_user_id === user.id) set.add(user.position);
+  }
+  for (const d of deps) if (d.deputy_user_id === user.id) set.add(d.position);
+  return set;
+}
+
+function deputyRecordJson(d) {
+  return {
+    id: d.id,
+    position: d.position,
+    deputyUsername: d.deputy_username,
+    deputyDisplayName: d.deputy_display_name,
+    active: d.active === 1,
+    enabledBy: d.enabled_by,
+    enabledAt: d.enabled_at,
+    revokedBy: d.revoked_by,
+    revokedAt: d.revoked_at,
+  };
+}
+
+function deputyRowsFor(versionId) {
+  return db.prepare('SELECT * FROM position_deputies WHERE version_id = ? ORDER BY id DESC').all(versionId);
+}
+
+function loadDraftCues() {
+  return db.prepare(
+    'SELECT id, code, title, position, planned_start, duration, row_ver FROM draft_cues ORDER BY id'
+  ).all().map((c) => ({
+    id: c.id, code: c.code, title: c.title, position: c.position,
+    plannedStart: c.planned_start, duration: c.duration, rowVersion: c.row_ver,
+  }));
+}
+
+function loadDraftDeps() {
+  return db.prepare('SELECT id, from_cue, to_cue FROM draft_deps ORDER BY id').all()
+    .map((d) => ({ id: d.id, from: d.from_cue, to: d.to_cue }));
+}
+
+function draftPayload() {
+  const cues = loadDraftCues();
+  const deps = loadDraftDeps();
+  const validation = validatePlan(cues, deps);
+  return {
+    version: Number(getMeta('draft_version', '0')),
+    positions: positionsList(),
+    cues: cues.map((c) => ({ ...c, plannedStartText: minToTime(c.plannedStart) })),
+    deps,
+    validation,
+  };
+}
+
+function cueInputFromBody(body) {
+  const code = String(body.code || '').trim();
+  const title = String(body.title || '').trim();
+  const position = String(body.position || '').trim();
+  const startText = String(body.plannedStartText || '').trim();
+  const plannedStart = timeToMin(startText);
+  const duration = Number(body.duration);
+  if (!code) throw new ApiError(400, 'BAD_INPUT', '提示项编号不能为空');
+  if (!position) throw new ApiError(400, 'BAD_INPUT', `「${code}」岗位不能为空`);
+  if (!positionsList().includes(position)) throw new ApiError(400, 'BAD_INPUT', `岗位「${position}」不在已配置岗位列表中`);
+  if (plannedStart === null) throw new ApiError(400, 'BAD_INPUT', `「${code}」计划开始时间格式应为 HH:MM`);
+  if (!Number.isInteger(duration) || duration <= 0) throw new ApiError(400, 'BAD_INPUT', `「${code}」时长必须为正整数分钟`);
+  return { code, title, position, plannedStart, duration };
+}
+
+function versionPayload(versionRow) {
+  const cues = db.prepare(
+    `SELECT cue_ref, code, title, position, planned_start, duration
+     FROM published_cues WHERE version_id = ? ORDER BY id`
+  ).all(versionRow.id).map((c) => ({
+    id: c.cue_ref, code: c.code, title: c.title, position: c.position,
+    plannedStart: c.planned_start, duration: c.duration,
+  }));
+  const deps = db.prepare(
+    'SELECT from_ref, to_ref FROM published_deps WHERE version_id = ? ORDER BY id'
+  ).all(versionRow.id).map((d) => ({ from: d.from_ref, to: d.to_ref }));
+
+  const regRows = db.prepare(
+    'SELECT * FROM registrations WHERE version_id = ?'
+  ).all(versionRow.id);
+  const regMap = new Map();
+  for (const r of regRows) {
+    regMap.set(r.cue_ref, {
+      actualStart: r.actual_start, actualEnd: r.actual_end,
+      estimatedEnd: r.estimated_end, skipped: r.skipped === 1,
+      rowVer: r.row_ver,
+      updatedBy: r.updated_by, updatedAt: r.updated_at,
+      sourceVersionId: r.source_version_id, sourceCueRef: r.source_cue_ref,
+    });
+  }
+
+  // 依赖链跳过留痕（每项至多一条）：操作者、时间、原因、触发根项
+  const skipMap = new Map();
+  db.prepare(
+    `SELECT cue_ref, root_cue_ref, reason, skipped_by, skipped_at
+     FROM registration_skips WHERE version_id = ?`
+  ).all(versionRow.id).forEach((s) => skipMap.set(s.cue_ref, {
+    rootCueRef: s.root_cue_ref,
+    reason: s.reason,
+    skippedBy: s.skipped_by,
+    skippedAt: s.skipped_at,
+  }));
+
+  const live = computeLive(cues, deps, regMap);
+  const latestId = (db.prepare('SELECT MAX(version_no) AS m FROM rehearsal_versions').get().m);
+
+  // 交接延续来源：sourceVersionId -> 版本号；(版本, cue_ref) -> 旧版编号
+  const sourceRefs = [...regMap.values()]
+    .filter((r) => r.sourceVersionId != null)
+    .map((r) => ({ svid: r.sourceVersionId, sref: r.sourceCueRef }));
+  const sourceVerNo = new Map();
+  const sourceCode = new Map();
+  if (sourceRefs.length) {
+    const vIds = [...new Set(sourceRefs.map((s) => s.svid))];
+    db.prepare(
+      `SELECT id, version_no FROM rehearsal_versions WHERE id IN (${vIds.map(() => '?').join(',')})`
+    ).all(...vIds).forEach((v) => sourceVerNo.set(v.id, v.version_no));
+    const q = db.prepare('SELECT code FROM published_cues WHERE version_id = ? AND cue_ref = ?');
+    for (const s of sourceRefs) {
+      const row = q.get(s.svid, s.sref);
+      sourceCode.set(`${s.svid}:${s.sref}`, row ? row.code : null);
+    }
+  }
+
+  const corrRows = db.prepare(
+    `SELECT cue_ref, field, old_value, new_value, reason, cascaded, corrected_by, corrected_at
+     FROM registration_corrections WHERE version_id = ?
+     ORDER BY COALESCE(group_id, id) DESC, id ASC`
+  ).all(versionRow.id);
+  const corrMap = new Map();
+  for (const c of corrRows) {
+    if (!corrMap.has(c.cue_ref)) corrMap.set(c.cue_ref, []);
+    corrMap.get(c.cue_ref).push({
+      field: c.field,
+      oldValueText: minToTime(c.old_value),
+      newValueText: minToTime(c.new_value),
+      reason: c.reason,
+      cascaded: c.cascaded === 1,
+      correctedBy: c.corrected_by,
+      correctedAt: c.corrected_at,
+    });
+  }
+
+  return {
+    id: versionRow.id,
+    versionNo: versionRow.version_no,
+    note: versionRow.note,
+    createdAt: versionRow.created_at,
+    isLatest: versionRow.version_no === latestId,
+    deputies: deputyRowsFor(versionRow.id).map(deputyRecordJson),
+    cues: live.cues.map((c) => ({
+      ...c,
+      plannedStartText: minToTime(c.plannedStart),
+      schedStartText: minToTime(c.schedStart),
+      schedEndText: minToTime(c.schedEnd),
+      actualStartText: minToTime(c.actualStart),
+      actualEndText: minToTime(c.actualEnd),
+      estimatedEndText: minToTime(c.estimatedEnd),
+      corrections: corrMap.get(c.id) || [],
+      skip: (() => {
+        const s = skipMap.get(c.id);
+        if (!s) return null;
+        const rootCue = cues.find((x) => x.id === s.rootCueRef);
+        return {
+          reason: s.reason,
+          skippedBy: s.skippedBy,
+          skippedAt: s.skippedAt,
+          rootCueRef: s.rootCueRef,
+          rootCode: rootCue ? rootCue.code : null,
+        };
+      })(),
+      handover: (() => {
+        const r = regMap.get(c.id);
+        if (!r || r.sourceVersionId == null) return null;
+        return {
+          sourceVersionId: r.sourceVersionId,
+          sourceVersionNo: sourceVerNo.get(r.sourceVersionId) ?? null,
+          sourceCueRef: r.sourceCueRef,
+          sourceCode: sourceCode.get(`${r.sourceVersionId}:${r.sourceCueRef}`) ?? c.code,
+        };
+      })(),
+    })),
+    conflicts: live.conflicts,
+    orderProblem: live.orderProblem,
+  };
+}
+
+// ---------- 认证 ----------
+
+app.post('/api/login', (req, res, next) => {
+  try {
+    const username = String(req.body.username || '').trim();
+    const password = String(req.body.password || '');
+    if (!username || !password) throw new ApiError(400, 'BAD_INPUT', '用户名与密码不能为空');
+    const u = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+    if (!u || !verifyPassword(password, u.password_hash)) {
+      throw new ApiError(401, 'BAD_CREDENTIALS', '用户名或密码错误');
+    }
+    req.session.user = { id: u.id, username: u.username, role: u.role, position: u.position, displayName: u.display_name };
+    res.json({ user: req.session.user });
+  } catch (e) { next(e); }
+});
+
+app.post('/api/logout', (req, res) => {
+  req.session.destroy(() => res.json({ ok: true }));
+});
+
+app.get('/api/me', (req, res) => {
+  res.json({ user: req.session.user || null, positions: positionsList() });
+});
+
+// ---------- 舞监：草稿编辑 ----------
+
+app.get('/api/draft', requireSM, (req, res, next) => {
+  try { res.json(draftPayload()); } catch (e) { next(e); }
+});
+
+app.get('/api/draft/validate', requireSM, (req, res, next) => {
+  try { res.json(validatePlan(loadDraftCues(), loadDraftDeps())); } catch (e) { next(e); }
+});
+
+app.post('/api/draft/cues', requireSM, (req, res, next) => {
+  try {
+    checkDraftVersion(req.body.version);
+    const fields = cueInputFromBody(req.body);
+    const dup = db.prepare('SELECT 1 FROM draft_cues WHERE code = ?').get(fields.code);
+    if (dup) throw new ApiError(400, 'BAD_INPUT', `编号「${fields.code}」已存在`);
+    db.prepare(
+      `INSERT INTO draft_cues(code, title, position, planned_start, duration)
+       VALUES (@code, @title, @position, @plannedStart, @duration)`
+    ).run(fields);
+    bumpDraftVersion();
+    res.status(201).json(draftPayload());
+  } catch (e) { next(e); }
+});
+
+app.put('/api/draft/cues/:id', requireSM, (req, res, next) => {
+  try {
+    checkDraftVersion(req.body.version);
+    const id = Number(req.params.id);
+    const cue = db.prepare('SELECT * FROM draft_cues WHERE id = ?').get(id);
+    if (!cue) throw new ApiError(404, 'NOT_FOUND', '提示项不存在');
+    if (Number(req.body.rowVersion) !== cue.row_ver) {
+      throw new ApiError(409, 'ROW_VERSION_CONFLICT',
+        `提示项「${cue.code}」已被修改：当前行版本 ${cue.row_ver}，提交基于 ${req.body.rowVersion}，请刷新后重试`,
+        { currentVersion: Number(getMeta('draft_version', '0')), currentRowVersion: cue.row_ver });
+    }
+    const fields = cueInputFromBody(req.body);
+    const dup = db.prepare('SELECT 1 FROM draft_cues WHERE code = ? AND id != ?').get(fields.code, id);
+    if (dup) throw new ApiError(400, 'BAD_INPUT', `编号「${fields.code}」已存在`);
+    db.prepare(
+      `UPDATE draft_cues SET code=@code, title=@title, position=@position,
+         planned_start=@plannedStart, duration=@duration, row_ver=row_ver+1 WHERE id=@id`
+    ).run({ ...fields, id });
+    bumpDraftVersion();
+    res.json(draftPayload());
+  } catch (e) { next(e); }
+});
+
+app.delete('/api/draft/cues/:id', requireSM, (req, res, next) => {
+  try {
+    checkDraftVersion(Number(req.query.version));
+    const id = Number(req.params.id);
+    const cue = db.prepare('SELECT * FROM draft_cues WHERE id = ?').get(id);
+    if (!cue) throw new ApiError(404, 'NOT_FOUND', '提示项不存在');
+    db.prepare('DELETE FROM draft_cues WHERE id = ?').run(id); // 依赖通过外键级联删除
+    bumpDraftVersion();
+    res.json(draftPayload());
+  } catch (e) { next(e); }
+});
+
+app.post('/api/draft/deps', requireSM, (req, res, next) => {
+  try {
+    checkDraftVersion(req.body.version);
+    const from = Number(req.body.from);
+    const to = Number(req.body.to);
+    if (!Number.isInteger(from) || !Number.isInteger(to)) throw new ApiError(400, 'BAD_INPUT', '前置/后项编号无效');
+    if (from === to) throw new ApiError(400, 'BAD_INPUT', '提示项不能以前置自身');
+    const cues = db.prepare('SELECT id FROM draft_cues WHERE id IN (?, ?)').all(from, to);
+    if (cues.length !== 2) throw new ApiError(404, 'NOT_FOUND', '前置或后项提示项不存在');
+    const exists = db.prepare('SELECT 1 FROM draft_deps WHERE from_cue=? AND to_cue=?').get(from, to);
+    if (exists) throw new ApiError(400, 'BAD_INPUT', '该前置关系已存在');
+    db.prepare('INSERT INTO draft_deps(from_cue, to_cue) VALUES (?, ?)').run(from, to);
+    bumpDraftVersion();
+    res.status(201).json(draftPayload());
+  } catch (e) { next(e); }
+});
+
+app.delete('/api/draft/deps/:id', requireSM, (req, res, next) => {
+  try {
+    checkDraftVersion(Number(req.query.version));
+    const id = Number(req.params.id);
+    const info = db.prepare('DELETE FROM draft_deps WHERE id = ?').run(id);
+    if (info.changes === 0) throw new ApiError(404, 'NOT_FOUND', '前置关系不存在');
+    bumpDraftVersion();
+    res.json(draftPayload());
+  } catch (e) { next(e); }
+});
+
+// ---------- 舞监：发布只读联排版本 ----------
+
+// 交接：旧执行版（最新已发布版本，没有则 null）
+function latestPublishedVersion() {
+  return db.prepare('SELECT * FROM rehearsal_versions ORDER BY version_no DESC LIMIT 1').get() || null;
+}
+
+// 某版本已发布提示项（以 cue_ref 为键）
+function publishedCueMap(versionId) {
+  const map = new Map();
+  db.prepare(
+    `SELECT cue_ref, code, title, position, planned_start, duration
+     FROM published_cues WHERE version_id = ?`
+  ).all(versionId).forEach((c) => map.set(c.cue_ref, c));
+  return map;
+}
+
+// 已发布前置集合：cue_ref -> Set(前置 cue_ref)
+function publishedPredSets(versionId) {
+  const sets = new Map();
+  db.prepare('SELECT from_ref, to_ref FROM published_deps WHERE version_id = ?')
+    .all(versionId).forEach((d) => {
+      if (!sets.has(d.to_ref)) sets.set(d.to_ref, new Set());
+      sets.get(d.to_ref).add(d.from_ref);
+    });
+  return sets;
+}
+
+// 草稿前置集合：cue id -> Set(前置 cue id)
+function draftPredSets() {
+  const sets = new Map();
+  db.prepare('SELECT from_cue, to_cue FROM draft_deps')
+    .all().forEach((d) => {
+      if (!sets.has(d.to_cue)) sets.set(d.to_cue, new Set());
+      sets.get(d.to_cue).add(d.from_cue);
+    });
+  return sets;
+}
+
+function sameSet(a, b) {
+  if (a.size !== b.size) return false;
+  for (const x of a) if (!b.has(x)) return false;
+  return true;
+}
+
+// 对照单个旧登记项给出交接资格判定
+function evaluateHandoverItem({ old, draftCue, oldPreds, draftPreds, oldCodeByRef, draftCodeById }) {
+  if (!draftCue) {
+    return { eligible: false, reasons: ['草稿中已不存在同一提示项引用'], diffs: [{ field: 'reference', reason: '草稿中已不存在该提示项引用' }] };
+  }
+  const fmtPreds = (set, codeOf) =>
+    [...set].sort((a, b) => a - b).map((r) => codeOf(r) || `#${r}`).join('、') || '（无）';
+  const oldPredsText = fmtPreds(oldPreds, (r) => oldCodeByRef.get(r));
+  const newPredsText = fmtPreds(draftPreds, draftCodeById);
+  const checks = [
+    { field: 'code', label: '编号', same: old.code === draftCue.code,
+      oldText: old.code, newText: draftCue.code },
+    { field: 'title', label: '说明', same: old.title === draftCue.title,
+      oldText: old.title || '（空）', newText: draftCue.title || '（空）' },
+    { field: 'position', label: '岗位', same: old.position === draftCue.position,
+      oldText: old.position, newText: draftCue.position },
+    { field: 'plannedStart', label: '计划开始', same: old.planned_start === draftCue.plannedStart,
+      oldText: minToTime(old.planned_start), newText: minToTime(draftCue.plannedStart) },
+    { field: 'duration', label: '时长', same: old.duration === draftCue.duration,
+      oldText: `${old.duration} 分`, newText: `${draftCue.duration} 分` },
+    { field: 'predecessors', label: '前置集合', same: sameSet(oldPreds, draftPreds),
+      oldText: oldPredsText, newText: newPredsText },
+  ];
+  const reasons = [];
+  const diffs = [];
+  for (const c of checks) {
+    if (!c.same) {
+      reasons.push(`${c.label}不一致（旧版 ${c.oldText} → 草稿 ${c.newText}）`);
+      diffs.push({ field: c.field, label: c.label, oldText: c.oldText, newText: c.newText,
+        reason: `${c.label}不一致：旧版为 ${c.oldText}，草稿为 ${c.newText}` });
+    }
+  }
+  return { eligible: reasons.length === 0, reasons, diffs };
+}
+
+/**
+ * 交接预览：对照当前草稿与旧执行版，列出旧版「已完成（实际开始与实际完成同时存在）」
+ * 提示项的交接资格、不合格原因及旧登记行版本号。无旧版时 eligible/ineligible 均为空。
+ */
+function buildHandoverPreview() {
+  const draftVersion = Number(getMeta('draft_version', '0'));
+  const oldVer = latestPublishedVersion();
+  if (!oldVer) return { draftVersion, oldVersion: null, eligible: [], ineligible: [] };
+
+  const draftCues = loadDraftCues();
+  const draftById = new Map(draftCues.map((c) => [c.id, c]));
+  const draftPredsAll = draftPredSets();
+  const oldCues = publishedCueMap(oldVer.id);
+  const oldPredSetsAll = publishedPredSets(oldVer.id);
+  const oldCodeByRef = new Map([...oldCues].map(([ref, c]) => [ref, c.code]));
+  const draftCodeById = (id) => draftById.get(id)?.code;
+
+  const eligible = [];
+  const ineligible = [];
+  const regRows = db.prepare(
+    'SELECT cue_ref, actual_start, actual_end, row_ver FROM registrations WHERE version_id = ?'
+  ).all(oldVer.id);
+  for (const reg of regRows) {
+    const old = oldCues.get(reg.cue_ref);
+    if (!old) continue;
+    // 只有旧登记同时有实际开始和实际完成（已完成）才进入交接判定
+    if (reg.actual_start === null || reg.actual_end === null) continue;
+
+    const item = {
+      cueRef: reg.cue_ref,
+      code: old.code,
+      title: old.title,
+      position: old.position,
+      actualStartText: minToTime(reg.actual_start),
+      actualEndText: minToTime(reg.actual_end),
+      rowVersion: reg.row_ver,
+    };
+    const draftCue = draftById.get(reg.cue_ref);
+    const ev = evaluateHandoverItem({
+      old,
+      draftCue,
+      oldPreds: oldPredSetsAll.get(reg.cue_ref) || new Set(),
+      draftPreds: draftPredsAll.get(reg.cue_ref) || new Set(),
+      oldCodeByRef,
+      draftCodeById,
+    });
+    if (ev.eligible) {
+      eligible.push({ ...item, selected: true });
+    } else {
+      ineligible.push({ ...item, reasons: ev.reasons, diffs: ev.diffs });
+    }
+  }
+
+  eligible.sort((a, b) => a.code.localeCompare(b.code, 'zh-Hans-CN'));
+  ineligible.sort((a, b) => a.code.localeCompare(b.code, 'zh-Hans-CN'));
+  return {
+    draftVersion,
+    oldVersion: { id: oldVer.id, versionNo: oldVer.version_no, note: oldVer.note, createdAt: oldVer.created_at },
+    eligible,
+    ineligible,
+  };
+}
+
+// 交接预览（舞监发布前）：无旧版时 eligible/ineligible 为空数组
+app.get('/api/publish/handover/preview', requireSM, (req, res, next) => {
+  try { res.json(buildHandoverPreview()); } catch (e) { next(e); }
+});
+
+// 解析发布请求中的交接选择（未传 handover 时返回 null，维持原发布行为）
+function parseHandoverBody(body) {
+  if (!Object.prototype.hasOwnProperty.call(body, 'handover')) return null;
+  const h = body.handover;
+  if (h === null || typeof h !== 'object' || Array.isArray(h)) {
+    throw new ApiError(400, 'BAD_INPUT', '交接选择格式无效：handover 应为对象 {oldVersionId, draftVersion, items}');
+  }
+  if (!Number.isInteger(h.oldVersionId)) {
+    throw new ApiError(400, 'BAD_INPUT', '交接选择缺少旧执行版 oldVersionId');
+  }
+  if (h.draftVersion === undefined || h.draftVersion === null || !Number.isInteger(Number(h.draftVersion))) {
+    throw new ApiError(400, 'BAD_INPUT', '交接选择缺少预览时的草稿版本号 draftVersion');
+  }
+  const rawItems = h.items;
+  if (!Array.isArray(rawItems)) {
+    throw new ApiError(400, 'BAD_INPUT', '交接选择 items 应为数组 [{cueRef, rowVersion}]');
+  }
+  const items = [];
+  const seen = new Set();
+  for (const it of rawItems) {
+    const cueRef = Number(it?.cueRef);
+    const rowVersion = Number(it?.rowVersion);
+    if (!Number.isInteger(cueRef) || !Number.isInteger(rowVersion)) {
+      throw new ApiError(400, 'BAD_INPUT', '交接选择每项须包含整数 cueRef 与 rowVersion，请重新预览后选择');
+    }
+    if (seen.has(cueRef)) throw new ApiError(400, 'BAD_INPUT', `交接选择中提示项引用 ${cueRef} 重复`);
+    seen.add(cueRef);
+    items.push({ cueRef, rowVersion });
+  }
+  return { oldVersionId: h.oldVersionId, draftVersion: Number(h.draftVersion), items };
+}
+
+app.post('/api/publish', requireSM, (req, res, next) => {
+  try {
+    const submitted = req.body.version;
+    // 未传 handover 字段时为 null，完全沿用原有发布行为
+    const handover = parseHandoverBody(req.body);
+
+    const result = db.transaction(() => {
+      const current = Number(getMeta('draft_version', '0'));
+      if (submitted === undefined || Number(submitted) !== current) {
+        throw new ApiError(409, 'VERSION_CONFLICT',
+          `草稿已被他人修改：当前版本号为 ${current}，提交基于 ${submitted ?? '空'}，请刷新后重试`,
+          { currentVersion: current, submittedVersion: submitted ?? null });
+      }
+
+      const cues = loadDraftCues();
+      const deps = loadDraftDeps();
+      const validation = validatePlan(cues, deps);
+
+      // 交接：确认发布时重新核对草稿版本、旧执行版及所选登记行版本，任一变化或资格失效整体拒绝
+      // cueRef -> { actualStart, actualEnd }，仅用于发布时写入延续登记
+      const carry = new Map();
+      let oldVerForCarry = null;
+      if (handover) {
+        // 草稿版本与旧执行版：即使未选择任何项也要核对（强制以最新预览为准）
+        if (handover.draftVersion !== current) {
+          throw new ApiError(409, 'HANDOVER_STALE',
+            `交接预览基于草稿版本 v${handover.draftVersion}，当前草稿版本为 v${current}，草稿已变化，请重新预览后再发布`,
+            { currentVersion: current, handoverDraftVersion: handover.draftVersion });
+        }
+        const oldVer = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(handover.oldVersionId);
+        if (!oldVer) {
+          throw new ApiError(409, 'HANDOVER_STALE', '交接选择的旧执行版不存在，请重新预览后再发布');
+        }
+        const latest = db.prepare('SELECT id FROM rehearsal_versions ORDER BY version_no DESC LIMIT 1').get();
+        if (!latest || latest.id !== oldVer.id) {
+          throw new ApiError(409, 'HANDOVER_STALE',
+            `交接预览基于第 ${oldVer.version_no} 版，但当前执行版已变化，请重新预览后再发布`,
+            { currentOldVersionId: latest ? latest.id : null });
+        }
+        oldVerForCarry = oldVer;
+
+        // 以下逐项核对仅针对实际选中的登记行
+        if (handover.items.length > 0) {
+          const cuesForHandover = loadDraftCues();
+          const draftById = new Map(cuesForHandover.map((c) => [c.id, c]));
+          const draftPredsAll = draftPredSets();
+          const oldCues = publishedCueMap(oldVer.id);
+          const oldPredSetsAll = publishedPredSets(oldVer.id);
+          const oldCodeByRef = new Map([...oldCues].map(([ref, c]) => [ref, c.code]));
+          const draftCodeById = (id) => draftById.get(id)?.code;
+
+          const itemErrors = [];
+          for (const sel of handover.items) {
+            const old = oldCues.get(sel.cueRef);
+            const reg = db.prepare(
+              'SELECT * FROM registrations WHERE version_id = ? AND cue_ref = ?'
+            ).get(oldVer.id, sel.cueRef);
+            if (!old || !reg) {
+              itemErrors.push({ cueRef: sel.cueRef, code: old?.code ?? null, reason: '该提示项在旧执行版中不存在，请重新预览后再发布' });
+              continue;
+            }
+            if (reg.actual_start === null || reg.actual_end === null) {
+              itemErrors.push({ cueRef: sel.cueRef, code: old.code, reason: `「${old.code}」旧登记已不再同时具备实际开始与实际完成，交接资格已失效` });
+              continue;
+            }
+            if (reg.row_ver !== sel.rowVersion) {
+              itemErrors.push({ cueRef: sel.cueRef, code: old.code,
+                reason: `「${old.code}」旧登记行版本已变化（预览时 v${sel.rowVersion}，当前 v${reg.row_ver}，可能被岗位登记或舞监更正更新），请重新预览后再发布`,
+                currentRowVersion: reg.row_ver });
+              continue;
+            }
+            const ev = evaluateHandoverItem({
+              old,
+              draftCue: draftById.get(sel.cueRef),
+              oldPreds: oldPredSetsAll.get(sel.cueRef) || new Set(),
+              draftPreds: draftPredsAll.get(sel.cueRef) || new Set(),
+              oldCodeByRef,
+              draftCodeById,
+            });
+            if (!ev.eligible) {
+              itemErrors.push({ cueRef: sel.cueRef, code: old.code, reason: `「${old.code}」交接资格已失效：${ev.reasons.join('；')}`, diffs: ev.diffs });
+              continue;
+            }
+            carry.set(sel.cueRef, { actualStart: reg.actual_start, actualEnd: reg.actual_end });
+          }
+          if (itemErrors.length) {
+            throw new ApiError(409, 'HANDOVER_STALE',
+              `交接资格核对未通过（${itemErrors.length} 项），本次发布已整体拒绝，请重新预览后再选择发布`,
+              { items: itemErrors });
+          }
+        }
+      }
+
+      if (!validation.ok) {
+        throw new ApiError(422, 'PUBLISH_CONFLICT', '存在冲突项，无法发布联排版本', { errors: validation.errors });
+      }
+      const maxNo = db.prepare('SELECT COALESCE(MAX(version_no), 0) AS m FROM rehearsal_versions').get().m;
+      const versionNo = maxNo + 1;
+      const info = db.prepare('INSERT INTO rehearsal_versions(version_no, note) VALUES (?, ?)')
+        .run(versionNo, String(req.body.note || `联排第 ${versionNo} 版`));
+      const versionId = info.lastInsertRowid;
+
+      const insCue = db.prepare(
+        `INSERT INTO published_cues(version_id, cue_ref, code, title, position, planned_start, duration)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      );
+      const insDep = db.prepare(
+        'INSERT INTO published_deps(version_id, from_ref, to_ref) VALUES (?, ?, ?)'
+      );
+      // 未选择交接的提示项保持空登记；所选项仅带入实际开始、实际完成，并标明来源版本与提示项
+      const insReg = db.prepare(
+        `INSERT INTO registrations(version_id, cue_ref, position, actual_start, actual_end, source_version_id, source_cue_ref)
+         VALUES (@version_id, @cue_ref, @position, @actual_start, @actual_end, @source_version_id, @source_cue_ref)`
+      );
+      for (const c of cues) insCue.run(versionId, c.id, c.code, c.title, c.position, c.plannedStart, c.duration);
+      for (const d of deps) insDep.run(versionId, d.from, d.to);
+      for (const c of cues) {
+        const h = carry.get(c.id);
+        insReg.run({
+          version_id: versionId,
+          cue_ref: c.id,
+          position: c.position,
+          actual_start: h ? h.actualStart : null,
+          actual_end: h ? h.actualEnd : null,
+          source_version_id: h ? oldVerForCarry.id : null,
+          source_cue_ref: h ? c.id : null,
+        });
+      }
+
+      const v2 = current + 1; // 发布同时推进草稿版本号，过期页面必须刷新
+      setMeta('draft_version', v2);
+      return { versionId, carriedCount: carry.size,
+        sourceVersionId: carry.size ? oldVerForCarry.id : null,
+        sourceVersionNo: carry.size ? oldVerForCarry.version_no : null };
+    })();
+
+    const row = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(result.versionId);
+    res.status(201).json({
+      ...versionPayload(row),
+      handover: {
+        carriedCount: result.carriedCount,
+        sourceVersionId: result.sourceVersionId,
+        sourceVersionNo: result.sourceVersionNo,
+      },
+    });
+  } catch (e) { next(e); }
+});
+
+app.get('/api/versions', requireAuth, (req, res, next) => {
+  try {
+    const rows = db.prepare(
+      `SELECT v.id, v.version_no, v.note, v.created_at,
+              (SELECT COUNT(*) FROM registrations r WHERE r.version_id = v.id
+                 AND (r.actual_start IS NOT NULL OR r.actual_end IS NOT NULL OR r.estimated_end IS NOT NULL)) AS reg_count,
+              (SELECT COUNT(*) FROM registrations r WHERE r.version_id = v.id AND r.skipped = 1) AS skip_count,
+              (SELECT COUNT(*) FROM published_cues p WHERE p.version_id = v.id) AS cue_count
+       FROM rehearsal_versions v ORDER BY v.version_no DESC`
+    ).all();
+    res.json({
+      versions: rows.map((r) => ({
+        id: r.id, versionNo: r.version_no, note: r.note,
+        createdAt: r.created_at, regCount: r.reg_count, skipCount: r.skip_count, cueCount: r.cue_count,
+      })),
+    });
+  } catch (e) { next(e); }
+});
+
+app.get('/api/versions/:id', requireAuth, (req, res, next) => {
+  try {
+    const row = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(Number(req.params.id));
+    if (!row) throw new ApiError(404, 'NOT_FOUND', '版本不存在');
+    res.json(versionPayload(row));
+  } catch (e) { next(e); }
+});
+
+app.get('/api/live', requireAuth, (req, res, next) => {
+  try {
+    const row = db.prepare('SELECT * FROM rehearsal_versions ORDER BY version_no DESC LIMIT 1').get();
+    if (!row) return res.json({ version: null, message: '尚未发布任何联排版本' });
+    const payload = versionPayload(row);
+    // 现场页面按最新授权显示可操作项：执行账号的有效岗位（含代班获得、排除被顶替）
+    if (req.session.user.role === 'operator') {
+      payload.myPositions = [...effectivePositionsFor(req.session.user, row.id)];
+    }
+    res.json({ version: payload });
+  } catch (e) { next(e); }
+});
+
+// ---------- 舞监：岗位代班（仅当前执行版可变更） ----------
+
+// 代班管理视图：当前执行版的代班记录（含已撤销历史）；舞监另返回可选岗位与执行账号
+function deputyManagePayload(ver, user) {
+  const payload = {
+    versionId: ver ? ver.id : null,
+    versionNo: ver ? ver.version_no : null,
+    deputies: ver ? deputyRowsFor(ver.id).map(deputyRecordJson) : [],
+  };
+  if (user.role === 'sm' && ver) {
+    payload.positions = db.prepare(
+      'SELECT DISTINCT position FROM published_cues WHERE version_id = ? ORDER BY position'
+    ).all(ver.id).map((r) => r.position);
+    payload.operators = db.prepare(
+      "SELECT username, display_name, position FROM users WHERE role = 'operator' ORDER BY username"
+    ).all().map((u) => ({ username: u.username, displayName: u.display_name, position: u.position }));
+  }
+  return payload;
+}
+
+app.get('/api/live/deputies', requireAuth, (req, res, next) => {
+  try {
+    const ver = db.prepare('SELECT * FROM rehearsal_versions ORDER BY version_no DESC LIMIT 1').get();
+    res.json(deputyManagePayload(ver, req.session.user));
+  } catch (e) { next(e); }
+});
+
+// 当前执行版（不存在则 409）；请求可携带 versionId 防止旧页面误操作新版本
+function currentLiveVersionForDeputy(body) {
+  const ver = db.prepare('SELECT * FROM rehearsal_versions ORDER BY version_no DESC LIMIT 1').get();
+  if (!ver) throw new ApiError(409, 'NO_LIVE_VERSION', '尚未发布任何联排版本，无法设置代班');
+  const vid = body?.versionId;
+  if (vid !== undefined && vid !== null && Number(vid) !== ver.id) {
+    throw new ApiError(409, 'VERSION_STALE',
+      `页面基于的联排版本已不是当前执行版（当前为第 ${ver.version_no} 版），请刷新后再变更代班`,
+      { currentVersionId: ver.id, currentVersionNo: ver.version_no });
+  }
+  return ver;
+}
+
+// 启用代班：同一事务内复核当前版、岗位归属、账号资格与在任唯一性，任一不通过不留部分记录
+app.post('/api/live/deputies', requireSM, (req, res, next) => {
+  try {
+    const position = String(req.body.position || '').trim();
+    const username = String(req.body.username || '').trim();
+    if (!position) throw new ApiError(400, 'BAD_INPUT', '请选择要设置代班的岗位');
+    if (!username) throw new ApiError(400, 'BAD_INPUT', '请选择代班执行账号');
+
+    const ver = db.transaction(() => {
+      const v = currentLiveVersionForDeputy(req.body);
+      const posExists = db.prepare(
+        'SELECT 1 FROM published_cues WHERE version_id = ? AND position = ? LIMIT 1'
+      ).get(v.id, position);
+      if (!posExists) {
+        throw new ApiError(400, 'POSITION_NOT_IN_VERSION',
+          `当前执行版（第 ${v.version_no} 版）没有岗位「${position}」的提示项，不能为该岗位设置代班`);
+      }
+      const u = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+      if (!u) throw new ApiError(404, 'UNKNOWN_ACCOUNT', `账号「${username}」不存在`);
+      if (u.role !== 'operator') {
+        throw new ApiError(400, 'NOT_OPERATOR', `账号「${username}」不是执行账号，不能作为代班`);
+      }
+      const existing = db.prepare(
+        'SELECT * FROM position_deputies WHERE version_id = ? AND position = ? AND active = 1'
+      ).get(v.id, position);
+      if (existing) {
+        throw new ApiError(409, 'DEPUTY_EXISTS',
+          `岗位「${position}」已有在任代班 ${existing.deputy_display_name}（${existing.deputy_username}），请先撤销再启用`);
+      }
+      const stamp = new Date().toLocaleString('sv-SE'); // YYYY-MM-DD HH:MM:SS
+      db.prepare(
+        `INSERT INTO position_deputies(version_id, position, deputy_user_id, deputy_username, deputy_display_name, active, enabled_by, enabled_at)
+         VALUES (?, ?, ?, ?, ?, 1, ?, ?)`
+      ).run(v.id, position, u.id, u.username, u.display_name, req.session.user.displayName, stamp);
+      return v;
+    })();
+
+    res.status(201).json(deputyManagePayload(ver, req.session.user));
+  } catch (e) { next(e); }
+});
+
+// 撤销代班：同一事务内复核当前版与在任状态；重复撤销明确报错，不留部分记录
+app.post('/api/live/deputies/revoke', requireSM, (req, res, next) => {
+  try {
+    const position = String(req.body.position || '').trim();
+    if (!position) throw new ApiError(400, 'BAD_INPUT', '请选择要撤销代班的岗位');
+
+    const ver = db.transaction(() => {
+      const v = currentLiveVersionForDeputy(req.body);
+      const existing = db.prepare(
+        'SELECT * FROM position_deputies WHERE version_id = ? AND position = ? AND active = 1'
+      ).get(v.id, position);
+      if (!existing) {
+        throw new ApiError(409, 'NO_ACTIVE_DEPUTY', `岗位「${position}」当前没有在任代班，无需撤销`);
+      }
+      const stamp = new Date().toLocaleString('sv-SE');
+      db.prepare('UPDATE position_deputies SET active = 0, revoked_by = ?, revoked_at = ? WHERE id = ?')
+        .run(req.session.user.displayName, stamp, existing.id);
+      return v;
+    })();
+
+    res.json(deputyManagePayload(ver, req.session.user));
+  } catch (e) { next(e); }
+});
+
+// ---------- 岗位：现场登记 ----------
+
+app.post('/api/registrations', requireAuth, (req, res, next) => {
+  try {
+    if (req.session.user.role !== 'operator') throw new ApiError(403, 'FORBIDDEN', '仅执行岗位可登记');
+    const versionId = Number(req.body.versionId);
+    const cueRef = Number(req.body.cueRef);
+    const rowVersion = Number(req.body.rowVersion);
+    const action = String(req.body.action || '');
+
+    // 同一事务内复核：当前执行版、代班授权、登记行版本；任一不通过整体拒绝，不改动登记
+    const ver = db.transaction(() => {
+      const verRow = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(versionId);
+      if (!verRow) throw new ApiError(404, 'NOT_FOUND', '联排版本不存在');
+      const latest = db.prepare('SELECT id FROM rehearsal_versions ORDER BY version_no DESC LIMIT 1').get();
+      if (!latest || latest.id !== verRow.id) {
+        throw new ApiError(409, 'VERSION_ARCHIVED',
+          `第 ${verRow.version_no} 版已不是当前执行版本（已有新版本发布），请刷新使用最新版本登记`);
+      }
+
+      const pc = db.prepare('SELECT * FROM published_cues WHERE version_id=? AND cue_ref=?').get(versionId, cueRef);
+      if (!pc) throw new ApiError(404, 'NOT_FOUND', '提示项不存在于该版本');
+
+      // 代班授权：原岗位被代班时原岗位账号失去该岗位登记权；
+      // 代班账号获得该岗位登记权且保留自己原有岗位权限（effectivePositionsFor）
+      if (!effectivePositionsFor(req.session.user, versionId).has(pc.position)) {
+        const dep = db.prepare(
+          'SELECT * FROM position_deputies WHERE version_id = ? AND position = ? AND active = 1'
+        ).get(versionId, pc.position);
+        if (dep && pc.position === req.session.user.position) {
+          throw new ApiError(403, 'DEPUTY_ACTIVE',
+            `岗位「${pc.position}」当前由 ${dep.deputy_display_name}（${dep.deputy_username}）代班，你的该岗位登记权已暂时移交，请刷新页面`);
+        }
+        throw new ApiError(403, 'FORBIDDEN', `「${pc.code}」属于岗位「${pc.position}」，当前账号只能登记本岗位提示项`);
+      }
+
+      const reg = db.prepare('SELECT * FROM registrations WHERE version_id=? AND cue_ref=?').get(versionId, cueRef);
+      if (!reg) throw new ApiError(404, 'NOT_FOUND', '登记记录不存在');
+      // 已被舞监标记跳过的依赖链项：执行账号不得再登记（预计结束已在跳过时清除，计划保留）
+      if (reg.skipped === 1) {
+        throw new ApiError(409, 'CUE_SKIPPED',
+          `「${pc.code}」已被舞监标记为跳过（不再执行），执行岗位不能登记；请刷新页面`);
+      }
+      if (rowVersion !== reg.row_ver) {
+        throw new ApiError(409, 'VERSION_CONFLICT',
+          `「${pc.code}」登记已被更新：当前行版本 ${reg.row_ver}，提交基于 ${rowVersion}，请刷新后重试`,
+          { currentRowVersion: reg.row_ver });
+      }
+
+      const parseOptTime = (v) => (v === undefined || v === null || v === '' ? null : timeToMin(v));
+      let patch;
+      const actor = req.session.user.displayName;
+      const stamp = new Date().toLocaleString('sv-SE'); // YYYY-MM-DD HH:MM:SS
+
+      if (action === 'start') {
+        if (reg.actual_start !== null) throw new ApiError(400, 'BAD_STATE', `「${pc.code}」已登记实际开始`);
+        const t = parseOptTime(req.body.time) ?? currentMinute();
+        patch = { actual_start: t };
+      } else if (action === 'estimate') {
+        if (reg.actual_end !== null) throw new ApiError(400, 'BAD_STATE', `「${pc.code}」已完成，不能再修改预计结束`);
+        const ee = parseOptTime(req.body.estimatedEndText);
+        if (ee === null) throw new ApiError(400, 'BAD_INPUT', '请填写预计结束时间（HH:MM）');
+        const lower = reg.actual_start !== null ? reg.actual_start : pc.planned_start;
+        if (ee < lower) {
+          throw new ApiError(400, 'BAD_INPUT',
+            `预计结束 ${minToTime(ee)} 早于${reg.actual_start !== null ? '实际开始' : '原计划开始'} ${minToTime(lower)}`);
+        }
+        patch = { estimated_end: ee };
+      } else if (action === 'complete') {
+        if (reg.actual_start === null) throw new ApiError(400, 'BAD_STATE', `「${pc.code}」尚未登记实际开始，无法完成`);
+        if (reg.actual_end !== null) throw new ApiError(400, 'BAD_STATE', `「${pc.code}」已完成`);
+        const t = parseOptTime(req.body.time) ?? currentMinute();
+        if (t < reg.actual_start) throw new ApiError(400, 'BAD_INPUT', `完成时刻 ${minToTime(t)} 早于实际开始 ${minToTime(reg.actual_start)}`);
+        patch = { actual_end: t };
+      } else {
+        throw new ApiError(400, 'BAD_INPUT', '未知登记动作');
+      }
+
+      db.prepare(
+        `UPDATE registrations SET ${Object.keys(patch).map((k) => `${k} = @${k}`).join(', ')},
+           row_ver = row_ver + 1, updated_by = @updated_by, updated_at = @updated_at
+         WHERE id = @id`
+      ).run({ ...patch, updated_by: actor, updated_at: stamp, id: reg.id });
+      return verRow;
+    })();
+
+    const payload = versionPayload(ver);
+    payload.myPositions = [...effectivePositionsFor(req.session.user, ver.id)];
+    res.json({ version: payload });
+  } catch (e) { next(e); }
+});
+
+// ---------- 舞监：现场登记更正（仅当前执行版本） ----------
+
+const CORRECTION_FIELDS = {
+  actual_start: { label: '实际开始', timeKey: 'actualStartText' },
+  actual_end: { label: '实际完成', timeKey: 'actualEndText' },
+  estimated_end: { label: '预计结束', timeKey: 'estimatedEndText' },
+};
+
+app.post('/api/registrations/corrections', requireSM, (req, res, next) => {
+  try {
+    const versionId = Number(req.body.versionId);
+    const cueRef = Number(req.body.cueRef);
+    const rowVersion = Number(req.body.rowVersion);
+    const field = String(req.body.field || '');
+    const clear = req.body.clear === true;
+    const reason = String(req.body.reason || '').trim();
+
+    const meta = CORRECTION_FIELDS[field];
+    if (!meta) throw new ApiError(400, 'BAD_INPUT', '更正字段无效（仅支持实际开始 / 实际完成 / 预计结束）');
+    if (!reason) throw new ApiError(400, 'BAD_INPUT', '请填写更正原因');
+    if (reason.length > 200) throw new ApiError(400, 'BAD_INPUT', '更正原因不能超过 200 字');
+
+    const ver = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(versionId);
+    if (!ver) throw new ApiError(404, 'NOT_FOUND', '联排版本不存在');
+    const latest = db.prepare('SELECT id FROM rehearsal_versions ORDER BY version_no DESC LIMIT 1').get();
+    if (!latest || latest.id !== ver.id) {
+      throw new ApiError(409, 'VERSION_ARCHIVED',
+        `第 ${ver.version_no} 版已归档（已有新版本发布），归档版本禁止更正，请刷新使用当前执行版本`);
+    }
+
+    const pc = db.prepare('SELECT * FROM published_cues WHERE version_id=? AND cue_ref=?').get(versionId, cueRef);
+    if (!pc) throw new ApiError(404, 'NOT_FOUND', '提示项不存在于该版本');
+
+    // 更正仅改现场登记，不动 published_cues（已发布计划）。
+    // 全部校验与写入在同一事务内：任一不合法均不写入部分更正与历史，行版本与岗位登记共用。
+    const result = db.transaction(() => {
+      const reg = db.prepare('SELECT * FROM registrations WHERE version_id=? AND cue_ref=?').get(versionId, cueRef);
+      if (!reg) throw new ApiError(404, 'NOT_FOUND', '登记记录不存在');
+      // 已跳过项只展示，舞监也不得更正其时间（跳过清除预计结束不可通过更正恢复）
+      if (reg.skipped === 1) {
+        throw new ApiError(409, 'CUE_SKIPPED',
+          `「${pc.code}」已被标记为跳过，跳过项的登记时间不可更正（保留已发布计划，仅展示跳过原因）`);
+      }
+      if (rowVersion !== reg.row_ver) {
+        throw new ApiError(409, 'VERSION_CONFLICT',
+          `「${pc.code}」登记已被更新（岗位可能已提交新登记）：当前行版本 ${reg.row_ver}，提交基于 ${rowVersion}，请刷新后重试`,
+          { currentRowVersion: reg.row_ver });
+      }
+
+      const parseOptTime = (v) => (v === undefined || v === null || v === '' ? null : timeToMin(v));
+      const next = {
+        actual_start: reg.actual_start,
+        actual_end: reg.actual_end,
+        estimated_end: reg.estimated_end,
+      };
+
+      const newValue = clear ? null : parseOptTime(req.body[meta.timeKey]);
+      if (!clear && newValue === null) {
+        throw new ApiError(400, 'BAD_INPUT', `请填写更正后的${meta.label}时间（HH:MM），或选择清除该项`);
+      }
+      if (reg[field] === newValue) {
+        throw new ApiError(400, 'BAD_INPUT',
+          `${meta.label}${newValue === null ? '本就为空' : `仍为 ${minToTime(newValue)}`}，无需更正`);
+      }
+      next[field] = newValue;
+
+      // 主更正在前；清除实际开始时级联清除实际完成（同样记录历史）
+      const history = [{ field, old: reg[field], new: newValue, cascaded: false }];
+      if (field === 'actual_start' && clear && reg.actual_end !== null) {
+        next.actual_end = null;
+        history.push({ field: 'actual_end', old: reg.actual_end, new: null, cascaded: true });
+      }
+
+      // 更正后的完成必须有开始且不得早于开始
+      if (next.actual_end !== null && next.actual_start === null) {
+        throw new ApiError(400, 'BAD_STATE',
+          field === 'actual_end' ? `「${pc.code}」没有实际开始，不能登记/保留实际完成，请先更正实际开始`
+                                 : `清除实际开始会使「${pc.code}」的实际完成失去开始依据，请同时处理实际完成`);
+      }
+      if (next.actual_end !== null && next.actual_end < next.actual_start) {
+        throw new ApiError(400, 'BAD_INPUT',
+          `实际完成 ${minToTime(next.actual_end)} 早于实际开始 ${minToTime(next.actual_start)}`);
+      }
+
+      // 保留的预计结束不得早于实际开始（无实际开始则为原计划开始）
+      if (next.estimated_end !== null) {
+        const lower = next.actual_start !== null ? next.actual_start : pc.planned_start;
+        if (next.estimated_end < lower) {
+          throw new ApiError(400, 'BAD_INPUT',
+            `保留的预计结束 ${minToTime(next.estimated_end)} 早于${next.actual_start !== null ? '实际开始' : '原计划开始'} ${minToTime(lower)}，请一并更正或清除预计结束`);
+        }
+      }
+
+      const actor = req.session.user.displayName;
+      const stamp = new Date().toLocaleString('sv-SE'); // YYYY-MM-DD HH:MM:SS
+      const insCorr = db.prepare(
+        `INSERT INTO registration_corrections(version_id, cue_ref, field, old_value, new_value, reason, cascaded, group_id, corrected_by, corrected_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      );
+      const primary = history[0];
+      const primaryId = insCorr.run(versionId, cueRef, primary.field, primary.old, primary.new,
+        reason, 0, null, actor, stamp).lastInsertRowid;
+      for (const h of history.slice(1)) {
+        insCorr.run(versionId, cueRef, h.field, h.old, h.new, reason,
+          h.cascaded ? 1 : 0, primaryId, actor, stamp);
+      }
+      db.prepare(
+        `UPDATE registrations SET actual_start=@actual_start, actual_end=@actual_end,
+           estimated_end=@estimated_end, row_ver=row_ver+1, updated_by=@updated_by, updated_at=@updated_at
+         WHERE id=@id`
+      ).run({
+        actual_start: next.actual_start,
+        actual_end: next.actual_end,
+        estimated_end: next.estimated_end,
+        updated_by: actor,
+        updated_at: stamp,
+        id: reg.id,
+      });
+      return { cascaded: history.length > 1 };
+    })();
+
+    // 成功后按现有规则重算后续未开始项及岗位冲突（versionPayload 内 computeLive）
+    const payload = versionPayload(ver);
+    res.json({ version: payload, cascaded: result.cascaded });
+  } catch (e) { next(e); }
+});
+
+// ---------- 舞监：依赖链跳过（仅当前执行版） ----------
+
+// 沿前置关系向后求闭包：根项 + 沿 from→to 可达的全部后继
+function successorClosure(versionId, rootRef) {
+  const adj = new Map();
+  db.prepare('SELECT from_ref, to_ref FROM published_deps WHERE version_id = ?')
+    .all(versionId).forEach((d) => {
+      if (!adj.has(d.from_ref)) adj.set(d.from_ref, []);
+      adj.get(d.from_ref).push(d.to_ref);
+    });
+  const seen = new Set([rootRef]);
+  const stack = [rootRef];
+  while (stack.length) {
+    const u = stack.pop();
+    for (const v of adj.get(u) || []) {
+      if (!seen.has(v)) { seen.add(v); stack.push(v); }
+    }
+  }
+  return seen;
+}
+
+// 当前执行版（不存在则 409）；请求可携带 versionId 防止旧页面误操作新版本
+function currentLiveVersionForSkip(bodyOrQuery) {
+  const ver = latestPublishedVersion();
+  if (!ver) throw new ApiError(409, 'NO_LIVE_VERSION', '尚未发布任何联排版本，无法执行跳过');
+  const vid = bodyOrQuery?.versionId;
+  if (vid !== undefined && vid !== null && Number(vid) !== ver.id) {
+    throw new ApiError(409, 'VERSION_STALE',
+      `页面基于的联排版本已不是当前执行版（当前为第 ${ver.version_no} 版），请刷新后再操作`,
+      { currentVersionId: ver.id, currentVersionNo: ver.version_no });
+  }
+  return ver;
+}
+
+function regStatusOf(reg) {
+  if (reg.skipped === 1) return 'SKIPPED';
+  if (reg.actual_end !== null) return 'DONE';
+  if (reg.actual_start !== null) return 'RUNNING';
+  return 'PENDING';
+}
+
+// 依赖链跳过预览：根项及其沿前置关系可达的全部后继；逐项给出状态与行版本，
+// 已有实际开始/完成的非跳过项列为阻断项；已跳过项只展示（含原因），不重复留痕。
+function buildSkipPreview(ver, cueRef) {
+  const pc = db.prepare('SELECT * FROM published_cues WHERE version_id=? AND cue_ref=?')
+    .get(ver.id, cueRef);
+  if (!pc) throw new ApiError(404, 'NOT_FOUND', '提示项不存在于当前执行版本');
+
+  const closure = successorClosure(ver.id, cueRef);
+  // 以拓扑序展示依赖链（根在前、后继在后）
+  const cueRows = [...publishedCueMap(ver.id).values()].map((c) => ({
+    id: c.cue_ref, code: c.code, title: c.title, position: c.position,
+    plannedStart: c.planned_start, duration: c.duration,
+  }));
+  const depRows = db.prepare('SELECT from_ref, to_ref FROM published_deps WHERE version_id = ?')
+    .all(ver.id).map((d) => ({ from: d.from_ref, to: d.to_ref }));
+  const { order } = topoAnalyze(cueRows, depRows);
+  const ordered = (order || [...closure]).filter((r) => closure.has(r));
+
+  const regStmt = db.prepare('SELECT * FROM registrations WHERE version_id=? AND cue_ref=?');
+  const cueMap = publishedCueMap(ver.id);
+  const skipRows = db.prepare(
+    'SELECT cue_ref, root_cue_ref, reason, skipped_by, skipped_at FROM registration_skips WHERE version_id = ?'
+  ).all(ver.id);
+  const skipInfo = new Map(skipRows.map((s) => [s.cue_ref, s]));
+
+  const chain = [];
+  const blockers = [];
+  let alreadySkippedCount = 0;
+  for (const ref of ordered) {
+    const cue = cueMap.get(ref);
+    const reg = regStmt.get(ver.id, ref);
+    if (!cue || !reg) {
+      throw new ApiError(500, 'INTERNAL', `提示项引用 ${ref} 的发布/登记数据缺失`);
+    }
+    const status = regStatusOf(reg);
+    const s = skipInfo.get(ref);
+    const item = {
+      cueRef: ref,
+      code: cue.code,
+      title: cue.title,
+      position: cue.position,
+      plannedStartText: minToTime(cue.planned_start),
+      plannedEndText: minToTime(cue.planned_start + cue.duration),
+      status,
+      rowVersion: reg.row_ver,
+      alreadySkipped: status === 'SKIPPED',
+      actualStartText: minToTime(reg.actual_start),
+      actualEndText: minToTime(reg.actual_end),
+      estimatedEndText: minToTime(reg.estimated_end),
+      isRoot: ref === cueRef,
+      skip: s ? {
+        reason: s.reason,
+        skippedBy: s.skipped_by,
+        skippedAt: s.skipped_at,
+        rootCode: (cueMap.get(s.root_cue_ref) || {}).code || null,
+      } : null,
+    };
+    chain.push(item);
+    if (status === 'SKIPPED') {
+      alreadySkippedCount += 1;
+    } else if (reg.actual_start !== null || reg.actual_end !== null) {
+      const what = reg.actual_end !== null
+        ? `已有实际开始 ${minToTime(reg.actual_start)}、实际完成 ${minToTime(reg.actual_end)}`
+        : `已有实际开始 ${minToTime(reg.actual_start)}`;
+      blockers.push({
+        cueRef: ref,
+        code: cue.code,
+        status,
+        currentRowVersion: reg.row_ver,
+        reason: `「${cue.code}」${what}，不能跳过（链中任一项已有实际开始或完成，整次操作将被拒绝）`,
+      });
+    }
+  }
+
+  return {
+    versionId: ver.id,
+    versionNo: ver.version_no,
+    root: { cueRef: cueRef, code: pc.code, title: pc.title, position: pc.position },
+    chain,
+    blockers,
+    canSkip: blockers.length === 0,
+    totalCount: chain.length,
+    alreadySkippedCount,
+    newlySkippedCount: chain.length - alreadySkippedCount - blockers.length,
+  };
+}
+
+// 跳过影响预览（舞监，仅当前执行版）
+app.get('/api/live/skips/preview', requireSM, (req, res, next) => {
+  try {
+    const ver = currentLiveVersionForSkip(req.query);
+    const cueRef = Number(req.query.cueRef);
+    if (!Number.isInteger(cueRef)) throw new ApiError(400, 'BAD_INPUT', '缺少有效的提示项引用 cueRef');
+    res.json(buildSkipPreview(ver, cueRef));
+  } catch (e) { next(e); }
+});
+
+// 确认跳过：同一事务内核验当前执行版、整条链范围、每个登记行版本、阻断状态；
+// 任一不通过整体拒绝，不留部分标记。首次跳过清除预计结束、保留已发布计划并留痕；
+// 已跳过项只展示、不重复留痕。
+app.post('/api/live/skips', requireSM, (req, res, next) => {
+  try {
+    const cueRef = Number(req.body.cueRef);
+    const reason = String(req.body.reason || '').trim();
+    if (!Number.isInteger(cueRef)) throw new ApiError(400, 'BAD_INPUT', '缺少有效的提示项引用 cueRef');
+    if (!reason) throw new ApiError(400, 'BAD_INPUT', '请填写跳过原因（不能为空）');
+    if (reason.length > 200) throw new ApiError(400, 'BAD_INPUT', '跳过原因不能超过 200 字');
+    const rawItems = req.body.items;
+    if (!Array.isArray(rawItems) || rawItems.length === 0) {
+      throw new ApiError(400, 'BAD_INPUT', '请基于预览所见的整条依赖链提交 items: [{cueRef, rowVersion}]');
+    }
+    const submitted = new Map();
+    for (const it of rawItems) {
+      const ref = Number(it?.cueRef);
+      const rv = Number(it?.rowVersion);
+      if (!Number.isInteger(ref) || !Number.isInteger(rv)) {
+        throw new ApiError(400, 'BAD_INPUT', '跳过链每项须包含整数 cueRef 与 rowVersion，请重新预览后再确认');
+      }
+      if (submitted.has(ref)) throw new ApiError(400, 'BAD_INPUT', `跳过链中提示项引用 ${ref} 重复`);
+      submitted.set(ref, rv);
+    }
+
+    const ver = db.transaction(() => {
+      const v = currentLiveVersionForSkip(req.body);
+      const pc = db.prepare('SELECT 1 FROM published_cues WHERE version_id=? AND cue_ref=?').get(v.id, cueRef);
+      if (!pc) throw new ApiError(404, 'NOT_FOUND', '提示项不存在于当前执行版本');
+
+      const closure = successorClosure(v.id, cueRef);
+
+      // 提交范围必须与预览的整条依赖链（根 + 全部可达后继）一致，防止漏项或多项
+      const missing = [...closure].filter((r) => !submitted.has(r));
+      const extra = [...submitted.keys()].filter((r) => !closure.has(r));
+      if (missing.length || extra.length) {
+        const parts = [];
+        if (missing.length) parts.push(`缺少链中提示项引用 ${missing.join(', ')}`);
+        if (extra.length) parts.push(`存在链外提示项引用 ${extra.join(', ')}`);
+        throw new ApiError(400, 'CHAIN_MISMATCH',
+          `提交的依赖链与当前版本不一致（${parts.join('；')}），请重新预览后再确认`);
+      }
+
+      const cueMap = publishedCueMap(v.id);
+      const regStmt = db.prepare('SELECT * FROM registrations WHERE version_id=? AND cue_ref=?');
+
+      // 1) 预览所见登记行版本变化 → 整次拒绝（含已跳过项的行版本）
+      const stale = [];
+      for (const [ref, rv] of submitted) {
+        const reg = regStmt.get(v.id, ref);
+        if (!reg) throw new ApiError(404, 'NOT_FOUND', '登记记录不存在');
+        if (rv !== reg.row_ver) {
+          stale.push({
+            cueRef: ref,
+            code: cueMap.get(ref)?.code ?? null,
+            previewRowVersion: rv,
+            currentRowVersion: reg.row_ver,
+            reason: `「${cueMap.get(ref)?.code || ref}」登记行版本已变化（预览时 v${rv}，当前 v${reg.row_ver}），请重新预览后再确认`,
+          });
+        }
+      }
+      if (stale.length) {
+        throw new ApiError(409, 'VERSION_CONFLICT',
+          `跳过链中 ${stale.length} 项登记行版本已变化，本次跳过已整体拒绝，请重新预览后再确认`,
+          { items: stale });
+      }
+
+      // 2) 链中任一项（非已跳过）已有实际开始或完成 → 整次拒绝并列出阻断项
+      const blockers = [];
+      for (const ref of closure) {
+        const reg = regStmt.get(v.id, ref);
+        if (reg.skipped === 1) continue; // 已跳过项只展示、不重复留痕
+        if (reg.actual_start !== null || reg.actual_end !== null) {
+          const cue = cueMap.get(ref);
+          const what = reg.actual_end !== null
+            ? `已有实际开始 ${minToTime(reg.actual_start)}、实际完成 ${minToTime(reg.actual_end)}`
+            : `已有实际开始 ${minToTime(reg.actual_start)}`;
+          blockers.push({
+            cueRef: ref,
+            code: cue.code,
+            currentRowVersion: reg.row_ver,
+            reason: `「${cue.code}」${what}，不能跳过`,
+          });
+        }
+      }
+      if (blockers.length) {
+        throw new ApiError(409, 'SKIP_BLOCKED',
+          `依赖链中 ${blockers.length} 项已有实际开始或完成，本次跳过已整体拒绝，未标记任何项`,
+          { items: blockers });
+      }
+
+      // 3) 全部校验通过：仅对未跳过项首跳留痕——清除预计结束，保留已发布计划
+      const stamp = new Date().toLocaleString('sv-SE'); // YYYY-MM-DD HH:MM:SS
+      const actor = req.session.user.displayName;
+      const upd = db.prepare(
+        `UPDATE registrations SET skipped = 1, estimated_end = NULL,
+           row_ver = row_ver + 1, updated_by = @by, updated_at = @at
+         WHERE version_id = @vid AND cue_ref = @ref AND skipped = 0`
+      );
+      const ins = db.prepare(
+        `INSERT INTO registration_skips(version_id, cue_ref, root_cue_ref, reason, skipped_by, skipped_at)
+         VALUES (@vid, @ref, @root, @reason, @by, @at)`
+      );
+      let newlySkipped = 0;
+      for (const ref of closure) {
+        const info = upd.run({ vid: v.id, ref, by: actor, at: stamp });
+        if (info.changes === 1) {
+          ins.run({ vid: v.id, ref, root: cueRef, reason, by: actor, at: stamp });
+          newlySkipped += 1;
+        }
+      }
+      return { ver: v, newlySkipped };
+    })();
+
+    const payload = versionPayload(ver.ver);
+    res.json({
+      version: payload,
+      skip: {
+        rootCueRef: cueRef,
+        rootCode: publishedCueMap(ver.ver.id).get(cueRef)?.code ?? null,
+        reason,
+        skippedBy: req.session.user.displayName,
+        newlySkippedCount: ver.newlySkipped,
+        alreadySkippedCount: closureSizeFor(ver.ver.id, cueRef) - ver.newlySkipped,
+        allAlreadySkipped: ver.newlySkipped === 0,
+      },
+    });
+  } catch (e) { next(e); }
+});
+
+// 链大小（仅响应汇总用）
+function closureSizeFor(versionId, rootRef) {
+  return successorClosure(versionId, rootRef).size;
+}
+
+// ---------- 静态页面与错误处理 ----------
+
+app.use(express.static(path.join(__dirname, '..', 'public')));
+
+app.use((err, req, res, next) => {
+  if (err instanceof SyntaxError && 'body' in err) {
+    return res.status(400).json({ error: 'BAD_JSON', message: '请求体不是合法 JSON' });
+  }
+  if (err instanceof ApiError) {
+    return res.status(err.status).json({ error: err.code, message: err.message, ...err.extra });
+  }
+  // eslint-disable-next-line no-console
+  console.error(err);
+  res.status(500).json({ error: 'INTERNAL', message: '服务器内部错误' });
+});
+
+const PORT = Number(process.env.PORT || 3000);
+if (require.main === module) {
+  app.listen(PORT, '0.0.0.0', () => {
+    // eslint-disable-next-line no-console
+    console.log(`联排提示板已启动: http://localhost:${PORT}`);
+  });
+}
+
+module.exports = app;
