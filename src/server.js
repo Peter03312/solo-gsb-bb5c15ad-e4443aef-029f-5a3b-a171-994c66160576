@@ -9,7 +9,7 @@ const session = require('express-session');
 const { db, getMeta, setMeta } = require('./db');
 const { verifyPassword } = require('./auth');
 const { init } = require('./initdb');
-const { timeToMin, minToTime, validatePlan, computeLive, topoAnalyze } = require('./scheduling');
+const { timeToMin, minToTime, validatePlan, computeLive, topoAnalyze, explainSchedule } = require('./scheduling');
 
 init();
 
@@ -156,21 +156,22 @@ function cueInputFromBody(body) {
   return { code, title, position, plannedStart, duration };
 }
 
-function versionPayload(versionRow) {
+// 某版本的计划与现场登记输入（发布时冻结的提示项/前置 + 当前登记），供现场重算与排期来源解释共用
+function versionInputs(versionId) {
   const cues = db.prepare(
     `SELECT cue_ref, code, title, position, planned_start, duration
      FROM published_cues WHERE version_id = ? ORDER BY id`
-  ).all(versionRow.id).map((c) => ({
+  ).all(versionId).map((c) => ({
     id: c.cue_ref, code: c.code, title: c.title, position: c.position,
     plannedStart: c.planned_start, duration: c.duration,
   }));
   const deps = db.prepare(
     'SELECT from_ref, to_ref FROM published_deps WHERE version_id = ? ORDER BY id'
-  ).all(versionRow.id).map((d) => ({ from: d.from_ref, to: d.to_ref }));
+  ).all(versionId).map((d) => ({ from: d.from_ref, to: d.to_ref }));
 
   const regRows = db.prepare(
     'SELECT * FROM registrations WHERE version_id = ?'
-  ).all(versionRow.id);
+  ).all(versionId);
   const regMap = new Map();
   for (const r of regRows) {
     regMap.set(r.cue_ref, {
@@ -181,6 +182,11 @@ function versionPayload(versionRow) {
       sourceVersionId: r.source_version_id, sourceCueRef: r.source_cue_ref,
     });
   }
+  return { cues, deps, regMap };
+}
+
+function versionPayload(versionRow) {
+  const { cues, deps, regMap } = versionInputs(versionRow.id);
 
   // 依赖链跳过留痕（每项至多一条）：操作者、时间、原因、触发根项
   const skipMap = new Map();
@@ -742,6 +748,39 @@ app.get('/api/versions/:id', requireAuth, (req, res, next) => {
     const row = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(Number(req.params.id));
     if (!row) throw new ApiError(404, 'NOT_FOUND', '版本不存在');
     res.json(versionPayload(row));
+  } catch (e) { next(e); }
+});
+
+// ---------- 排期开始来源解释（舞监与执行岗位均可；当前执行版与历史版本通用，只读） ----------
+
+// 以目标项原计划开始为基线，解释其重算开始时刻如何形成：达到最终最大约束时刻的直接前置全部列出，
+// 并沿尚未开始前置逐层追溯来源（实际完成 / 预计结束 / 按时长推算）；已跳过前置不构成约束。
+// 只读查询：不改动登记与已发布计划；目标不存在 / 版本不存在 / 目标已开始、已完成、已跳过时给出明确结果。
+app.get('/api/versions/:id/cues/:cueRef/explain', requireAuth, (req, res, next) => {
+  try {
+    const versionId = Number(req.params.id);
+    const cueRef = Number(req.params.cueRef);
+    if (!Number.isInteger(versionId)) throw new ApiError(404, 'NOT_FOUND', '版本不存在');
+    if (!Number.isInteger(cueRef)) throw new ApiError(400, 'BAD_INPUT', '缺少有效的提示项引用 cueRef');
+    const ver = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(versionId);
+    if (!ver) throw new ApiError(404, 'NOT_FOUND', '版本不存在');
+    const pc = db.prepare('SELECT 1 FROM published_cues WHERE version_id = ? AND cue_ref = ?').get(ver.id, cueRef);
+    if (!pc) throw new ApiError(404, 'NOT_FOUND', '提示项不存在于该版本');
+
+    const { cues, deps, regMap } = versionInputs(ver.id);
+    const skipReasons = new Map();
+    db.prepare('SELECT cue_ref, reason FROM registration_skips WHERE version_id = ?')
+      .all(ver.id).forEach((s) => skipReasons.set(s.cue_ref, s.reason));
+
+    const explain = explainSchedule(cues, deps, regMap, cueRef, skipReasons);
+    if (explain.notFound) throw new ApiError(404, 'NOT_FOUND', '提示项不存在于该版本');
+    const latestNo = db.prepare('SELECT MAX(version_no) AS m FROM rehearsal_versions').get().m;
+    res.json({
+      versionId: ver.id,
+      versionNo: ver.version_no,
+      isLatest: ver.version_no === latestNo,
+      ...explain,
+    });
   } catch (e) { next(e); }
 });
 

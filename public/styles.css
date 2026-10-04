@@ -142,3 +142,21 @@ tr.skipped-row td strong { color: #5b3a9a; }
 .modal-head h3 { margin: 0; font-size: 16px; }
 #corr-form textarea { padding: 8px 10px; border: 1px solid #cbd2dc; border-radius: 8px; font-size: 13px; font-family: inherit; resize: vertical; }
 #corr-form .error-text { margin: 0; }
+
+/* 排期来源解释 */
+.explain-btn { margin-top: 2px; }
+.explain-cue { font-size: 14px; margin-bottom: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.explain-baseline { background: #eef1f5; border-radius: 8px; padding: 8px 12px; margin-bottom: 8px; font-size: 13px; }
+.explain-plan { background: #e9f8ef; border: 1px solid #b6e2c6; color: #1d7a43; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; font-size: 13px; }
+.explain-max { background: #fdf3e7; border: 1px solid #f0cf9f; color: #8a5a00; border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; font-size: 13px; }
+.explain-na { background: #f6f7f9; border: 1px solid #dfe3ea; border-radius: 8px; padding: 12px 14px; font-size: 13px; margin-top: 8px; }
+.explain-tree { margin: 6px 0 10px; }
+.trace-node { border-left: 3px solid #d3d9e2; padding: 4px 0 4px 12px; margin: 6px 0; }
+.trace-line { font-size: 13px; line-height: 1.8; white-space: normal; }
+.trace-line.sub-head { color: #556; }
+.trace-sub { margin-left: 16px; }
+.src-tag { display: inline-block; border-radius: 6px; padding: 0 8px; font-size: 11px; margin: 0 4px; white-space: nowrap; }
+.src-tag.src-actual { background: #e2f5e9; color: #1d7a43; }
+.src-tag.src-estimated { background: #fff3df; color: #9a6200; }
+.src-tag.src-duration { background: #e8eefc; color: #2f56c4; }
+.explain-skipped { margin: 6px 0; font-size: 12px; color: #5b3a9a; }

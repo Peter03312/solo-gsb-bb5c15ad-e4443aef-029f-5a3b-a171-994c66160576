@@ -271,4 +271,156 @@ function computeLive(publishedCues, deps, regMap) {
   return { cues, conflicts, orderProblem: null };
 }
 
-module.exports = { timeToMin, minToTime, topoAnalyze, validatePlan, computeLive };
+const EXPLAIN_STATUS_LABEL = { PENDING: '未开始', RUNNING: '已开始', DONE: '已完成', SKIPPED: '已跳过' };
+
+/**
+ * 排期开始来源解释（只读）。与现场重算共用同一 computeLive 结果，保证与同一版本的重算一致。
+ *
+ * 以目标项原计划开始为基线：
+ * - 列出所有「结束时刻 = 最终最大约束时刻」的直接前置；同一最大时刻由多条路径共同决定时全部展示；
+ * - 沿尚未开始的前置逐层追溯其结束时刻来源：实际完成 / 预计结束 / 按时长推算；
+ * - 已跳过前置不构成约束（单独列出）；原计划本身决定开始时 decidedByPlan=true（无需顺延）；
+ * - 目标已开始 / 已完成 / 已跳过时 applicable=false 并给出明确原因。
+ *
+ * publishedCues / deps / regMap 与 computeLive 入参相同；
+ * cueRef 为目标提示项引用；skipReasons 可选 Map(cueRef -> 跳过原因)，仅用于展示。
+ */
+function explainSchedule(publishedCues, deps, regMap, cueRef, skipReasons) {
+  const live = computeLive(publishedCues, deps, regMap);
+  if (live.orderProblem) {
+    return { applicable: false, reason: `已发布数据检测到依赖环，无法重算：${live.orderProblem}` };
+  }
+  const byId = new Map(live.cues.map((c) => [c.id, c]));
+  const target = byId.get(cueRef);
+  if (!target) return { notFound: true };
+
+  const predsOf = new Map();
+  publishedCues.forEach((c) => predsOf.set(c.id, []));
+  for (const d of deps) {
+    if (predsOf.has(d.to) && byId.has(d.from)) predsOf.get(d.to).push(d.from);
+  }
+
+  const brief = (c) => ({
+    cueRef: c.id,
+    code: c.code,
+    title: c.title,
+    position: c.position,
+    status: c.status,
+    statusLabel: EXPLAIN_STATUS_LABEL[c.status] || c.status,
+  });
+
+  if (target.status !== 'PENDING') {
+    const reason = target.status === 'RUNNING'
+      ? `「${target.code}」已于 ${minToTime(target.actualStart)} 实际开始，排期开始即实际开始，无需顺延解释`
+      : target.status === 'DONE'
+        ? `「${target.code}」已完成（实际开始 ${minToTime(target.actualStart)}，实际完成 ${minToTime(target.actualEnd)}），不存在待解释的排期开始`
+        : `「${target.code}」已被舞监标记为跳过，不产生排期开始时刻（已跳过前置不构成约束）`;
+    return {
+      applicable: false,
+      cue: {
+        ...brief(target),
+        plannedStartText: minToTime(target.plannedStart),
+        plannedEndText: minToTime(target.plannedStart + target.duration),
+        actualStartText: minToTime(target.actualStart),
+        actualEndText: minToTime(target.actualEnd),
+      },
+      reason,
+    };
+  }
+
+  // 单个前置的结束时刻来源；未开始且按时长推算时继续向下追溯其重算开始的形成
+  function traceNode(p, stack) {
+    const node = { ...brief(p), end: p.schedEnd, endText: minToTime(p.schedEnd) };
+    if (p.status === 'DONE') {
+      node.endSource = 'actual';
+      node.endSourceLabel = '实际完成';
+      node.endDetail = `实际开始 ${minToTime(p.actualStart)}，实际完成 ${minToTime(p.actualEnd)}`;
+    } else if (p.estimatedEnd !== null && p.estimatedEnd !== undefined) {
+      node.endSource = 'estimated';
+      node.endSourceLabel = '预计结束';
+      node.endDetail = `${p.status === 'RUNNING' ? '已开始，' : ''}登记的预计结束 ${minToTime(p.estimatedEnd)}`;
+    } else if (p.status === 'RUNNING') {
+      node.endSource = 'duration';
+      node.endSourceLabel = '按时长推算';
+      node.endDetail = `实际开始 ${minToTime(p.actualStart)} + 时长 ${p.duration} 分`;
+    } else {
+      node.endSource = 'duration';
+      node.endSourceLabel = '按时长推算';
+      node.endDetail = `重算开始 ${minToTime(p.schedStart)} + 时长 ${p.duration} 分`;
+      if (!stack.includes(p.id)) node.start = startExplain(p, stack.concat(p.id));
+    }
+    return node;
+  }
+
+  // 某未开始项的重算开始如何形成：原计划为基线，达到最终最大时刻的直接前置全部列出
+  function startExplain(cue, stack) {
+    const maxTime = cue.schedStart;
+    const decidedByPlan = maxTime === cue.plannedStart;
+    const constraints = [];
+    const skippedPreds = [];
+    const otherPreds = [];
+    for (const pid of predsOf.get(cue.id) || []) {
+      const p = byId.get(pid);
+      if (!p) continue;
+      if (p.status === 'SKIPPED') {
+        // 已跳过前置不构成约束
+        skippedPreds.push({
+          ...brief(p),
+          skipReason: skipReasons && skipReasons.get(pid) ? String(skipReasons.get(pid)) : null,
+        });
+      } else if (p.schedEnd === maxTime) {
+        // 达到最终最大约束时刻的直接前置：多条路径共同决定时全部展示，不任意取舍
+        constraints.push(traceNode(p, stack));
+      } else {
+        otherPreds.push({ ...brief(p), end: p.schedEnd, endText: minToTime(p.schedEnd) });
+      }
+    }
+    return {
+      plannedStart: cue.plannedStart,
+      plannedStartText: minToTime(cue.plannedStart),
+      schedStart: maxTime,
+      schedStartText: minToTime(maxTime),
+      decidedByPlan,
+      delayed: maxTime > cue.plannedStart,
+      constraints,
+      skippedPreds,
+      otherPreds,
+    };
+  }
+
+  const start = startExplain(target, [target.id]);
+  const delayMinutes = target.schedStart - target.plannedStart;
+  const summary = start.decidedByPlan
+    ? `「${target.code}」按原计划 ${minToTime(target.plannedStart)} 开始，无需顺延`
+      + (start.constraints.length ? `；另有 ${start.constraints.length} 条前置结束时刻恰与原计划相同（未造成顺延）` : '')
+    : `「${target.code}」重算开始 ${minToTime(target.schedStart)}，较原计划 ${minToTime(target.plannedStart)} 顺延 ${delayMinutes} 分钟；`
+      + `达到最终约束时刻 ${minToTime(target.schedStart)} 的直接前置共 ${start.constraints.length} 条，全部展示`;
+
+  return {
+    applicable: true,
+    cue: {
+      ...brief(target),
+      plannedStart: target.plannedStart,
+      plannedStartText: minToTime(target.plannedStart),
+      plannedEndText: minToTime(target.plannedStart + target.duration),
+      duration: target.duration,
+      schedStart: target.schedStart,
+      schedStartText: minToTime(target.schedStart),
+      schedEnd: target.schedEnd,
+      schedEndText: minToTime(target.schedEnd),
+      estimatedEndText: minToTime(target.estimatedEnd),
+      delayed: target.delayed,
+    },
+    baselineText: minToTime(target.plannedStart),
+    maxTimeText: minToTime(target.schedStart),
+    delayMinutes,
+    decidedByPlan: start.decidedByPlan,
+    delayed: start.delayed,
+    constraints: start.constraints,
+    skippedPreds: start.skippedPreds,
+    otherPreds: start.otherPreds,
+    summary,
+  };
+}
+
+module.exports = { timeToMin, minToTime, topoAnalyze, validatePlan, computeLive, explainSchedule };

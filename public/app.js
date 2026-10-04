@@ -476,6 +476,11 @@ function statusBadge(s) {
   return '<span class="badge pending">未开始</span>';
 }
 
+// 排期来源入口：任一提示项均可查看其排期开始时刻如何形成（未开始项给出完整来源链）
+function explainBtn(c, scope) {
+  return `<button class="ghost tiny explain-btn" data-act="open-explain" data-scope="${scope}" data-cue="${c.id}" title="查看排期开始时刻如何形成">来源</button>`;
+}
+
 // 依赖链跳过标注（含操作者、时间、原因与触发根项）；点击可看完整原因
 function skipTag(c) {
   if (!c.skip) return '';
@@ -548,7 +553,7 @@ function renderLive() {
       <td>${esc(c.title)}</td>
       <td>${esc(c.position)}${deputyPosTag(activeDepByPos.get(c.position))}</td>
       <td class="mono">${c.plannedStartText} - ${minText(c.plannedStart + c.duration)}</td>
-      <td class="mono">${skipped ? '—' : `${c.schedStartText}${delayed}`}</td>
+      <td class="mono">${skipped ? '—' : `${c.schedStartText}${delayed}`}<div>${explainBtn(c, 'live')}</div></td>
       <td class="mono">${skipped ? '—' : c.schedEndText}</td>
       <td>${statusBadge(c.status)}<div class="muted">v${c.rowVer}</div></td>
       <td class="mono">${skipped ? '—' : (c.actualStartText ?? '—')}${handoverTag(c)}${skipTag(c)}</td>
@@ -779,9 +784,13 @@ function renderHistoryHtml(cue, v) {
 }
 
 $('#live-tbody').addEventListener('click', (ev) => {
-  const corrBtn = ev.target.closest('button[data-act="open-correct"], button[data-act="open-history"], button[data-act="open-skip-preview"], button[data-act="open-skip-view"]');
+  const corrBtn = ev.target.closest('button[data-act="open-correct"], button[data-act="open-history"], button[data-act="open-skip-preview"], button[data-act="open-skip-view"], button[data-act="open-explain"]');
   if (!corrBtn) return;
   const cueId = Number(corrBtn.dataset.cue);
+  if (corrBtn.dataset.act === 'open-explain') {
+    openExplain(cueId, 'live');
+    return;
+  }
   const { v, cue } = findCueInContext('live', cueId);
   if (!cue) return;
   if (corrBtn.dataset.act === 'open-history') {
@@ -922,6 +931,96 @@ $('#modal-overlay').addEventListener('submit', async (ev) => {
   }
 });
 
+// ---------- 排期开始来源解释（当前执行版与历史版本通用，只读） ----------
+
+async function openExplain(cueId, scope) {
+  const v = scope === 'live' ? state.live : state.detail;
+  if (!v) return;
+  openModal('排期来源', '<div class="muted">正在以原计划开始为基线追溯来源链…</div>');
+  try {
+    const data = await api('GET', `/api/versions/${v.id}/cues/${cueId}/explain`);
+    openModal(`排期来源：${data.cue?.code || ''}`, renderExplainHtml(data));
+  } catch (e) {
+    closeModal();
+    alertBar('error', errorToHtml(e));
+    if (e.status === 409 && scope === 'live') loadLive().catch(() => {});
+  }
+}
+
+function renderExplainHtml(data) {
+  const head = `<div class="muted">第 ${data.versionNo} 版${data.isLatest ? '（当前执行版）' : '（归档版本 · 按归档状态只读回看）'}</div>`;
+  if (!data.applicable) {
+    const c = data.cue || {};
+    const badge = c.status
+      ? statusBadge(c.status) : '';
+    return `${head}
+      <div class="explain-na">
+        <div><strong>${esc(c.code || '')}</strong> ${esc(c.title || '')}（${esc(c.position || '')}）${badge}
+          <span class="mono muted">计划 ${esc(c.plannedStartText || '')} - ${esc(c.plannedEndText || '')}</span></div>
+        <p>${esc(data.reason || '该提示项当前没有可解释的排期开始。')}</p>
+        <div class="muted">登记、更正或跳过后刷新页面，可查看最新解释；本查询不改动登记与已发布计划。</div>
+      </div>`;
+  }
+  const c = data.cue;
+  let html = `${head}
+    <div class="explain-cue">
+      <strong>${esc(c.code)}</strong> ${esc(c.title || '')}（${esc(c.position)}）
+      <span class="mono">计划 ${esc(c.plannedStartText)} - ${esc(c.plannedEndText)}（${c.duration} 分）</span>
+      ${statusBadge(c.status)}
+    </div>
+    <div class="explain-baseline">基线：原计划开始 <strong class="mono">${esc(data.baselineText)}</strong>（重算开始不早于该时刻）</div>`;
+  if (data.decidedByPlan) {
+    html += `<div class="explain-plan">✅ 原计划本身决定开始：重算开始 <strong class="mono">${esc(data.maxTimeText)}</strong> ＝ 原计划开始，<strong>无需顺延</strong>。</div>`;
+    if (data.constraints.length) {
+      html += `<div class="muted">以下 ${data.constraints.length} 条直接前置的结束时刻恰与原计划相同（共同达到 ${esc(data.maxTimeText)}，未造成顺延）：</div>
+        <div class="explain-tree">${data.constraints.map(renderTraceNode).join('')}</div>`;
+    }
+  } else {
+    html += `<div class="explain-max">重算开始 <strong class="mono">${esc(data.maxTimeText)}</strong>（较原计划顺延 ${data.delayMinutes} 分钟）：
+      达到最终约束时刻 <strong class="mono">${esc(data.maxTimeText)}</strong> 的直接前置共 <strong>${data.constraints.length}</strong> 条，全部展示如下：</div>
+      <div class="explain-tree">${data.constraints.map(renderTraceNode).join('')}</div>`;
+  }
+  html += renderSkippedPreds(data.skippedPreds);
+  html += renderOtherPreds(data.otherPreds);
+  html += `<div class="muted">来源链与第 ${data.versionNo} 版现场重算结果一致；登记、更正或跳过后刷新即可看到最新解释。已跳过前置不构成约束；本查询不改动登记与已发布计划。</div>`;
+  return html;
+}
+
+function renderTraceNode(node) {
+  let html = `<div class="trace-node">
+    <div class="trace-line">
+      <strong>${esc(node.code)}</strong> ${esc(node.title || '')}（${esc(node.position)}）
+      结束 <strong class="mono">${esc(node.endText)}</strong>
+      <span class="src-tag src-${esc(node.endSource)}">${esc(node.endSourceLabel)}</span>
+      <span class="muted">${esc(node.endDetail || '')}</span>
+    </div>`;
+  if (node.start) {
+    const s = node.start;
+    html += `<div class="trace-sub">
+      <div class="trace-line sub-head">↳ 「${esc(node.code)}」尚未开始，其重算开始 <strong class="mono">${esc(s.schedStartText)}</strong>
+        ${s.decidedByPlan
+          ? `＝ 原计划开始 ${esc(s.plannedStartText)}（该层无需顺延）`
+          : `＝ max（原计划 ${esc(s.plannedStartText)}，下列前置结束），该层顺延 ${s.schedStart - s.plannedStart} 分钟`}</div>
+      ${s.constraints.map(renderTraceNode).join('')}
+      ${renderSkippedPreds(s.skippedPreds)}
+      ${renderOtherPreds(s.otherPreds)}
+    </div>`;
+  }
+  return html + '</div>';
+}
+
+function renderSkippedPreds(list) {
+  if (!list?.length) return '';
+  return `<div class="explain-skipped">已跳过前置（不构成约束）：${list.map((p) =>
+    `<span class="skip-tag">⛔ ${esc(p.code)}${p.skipReason ? `：${esc(p.skipReason)}` : ''}</span>`).join(' ')}</div>`;
+}
+
+function renderOtherPreds(list) {
+  if (!list?.length) return '';
+  return `<div class="muted">其他前置（结束时刻早于最终约束，未决定该开始）：${list.map((p) =>
+    `${esc(p.code)} 结束 ${esc(p.endText)}`).join('；')}</div>`;
+}
+
 function openCorrectForm(cue, v) {
   const options = CORR_FIELDS.map((f) =>
     `<option value="${f.key}">${f.label}（当前 ${cue[f.timeKey] ?? '空'}）</option>`).join('');
@@ -1061,6 +1160,11 @@ $('#versions-tbody').addEventListener('click', async (ev) => {
 
 // 回看页（含归档版本）只展示更正历史与跳过原因，不提供更正/跳过入口
 $('#version-detail').addEventListener('click', (ev) => {
+  const exBtn = ev.target.closest('button[data-act="open-explain"]');
+  if (exBtn) {
+    openExplain(Number(exBtn.dataset.cue), 'detail');
+    return;
+  }
   const histBtn = ev.target.closest('button[data-act="open-history"]');
   if (histBtn) {
     const cueId = Number(histBtn.dataset.cue);
@@ -1115,7 +1219,7 @@ function renderDetail() {
         <td>${esc(c.title)}</td>
         <td>${esc(c.position)}</td>
         <td class="mono">${c.plannedStartText} - ${minText(c.plannedStart + c.duration)}</td>
-        <td class="mono">${skipped ? '—' : `${c.schedStartText}${c.delayed ? '<div class="delayed">顺延</div>' : ''}`}</td>
+        <td class="mono">${skipped ? '—' : `${c.schedStartText}${c.delayed ? '<div class="delayed">顺延</div>' : ''}`}<div>${explainBtn(c, 'detail')}</div></td>
         <td class="mono">${skipped ? '—' : c.schedEndText}</td>
         <td>${statusBadge(c.status)}</td>
         <td class="mono">${skipped ? '—' : (c.actualStartText ?? '—')}${handoverTag(c)}${skipTag(c)}</td>
